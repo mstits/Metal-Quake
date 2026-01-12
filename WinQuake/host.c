@@ -863,10 +863,15 @@ void Host_Init (quakeparms_t *parms)
 	Key_Init ();
 	Con_Init ();	
 	M_Init ();	
+printf("Host_Init: After M_Init\n");
 	PR_Init ();
+printf("Host_Init: After PR_Init\n");
 	Mod_Init ();
+printf("Host_Init: After Mod_Init\n");
 	NET_Init ();
+printf("Host_Init: After NET_Init\n");
 	SV_Init ();
+printf("Host_Init: After SV_Init\n");
 
 	Con_Printf ("Exe: "__TIME__" "__DATE__"\n");
 	Con_Printf ("%4.1f megabyte heap\n",parms->memsize/ (1024*1024.0));
