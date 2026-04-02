@@ -99,18 +99,75 @@ extern "C" void IN_Commands(void) {
 
     GCExtendedGamepad *pad = currentController.extendedGamepad;
     
-    // Example: Map Right Trigger to Fire
+    // Right Trigger → Fire
     if (pad.rightTrigger.value > 0.3f) {
-        Key_Event(K_CTRL, 1); // Press fire
+        Key_Event(K_CTRL, 1);
     } else {
         Key_Event(K_CTRL, 0);
     }
     
-    if (pad.buttonA.isPressed) {
-        Key_Event(K_SPACE, 1); // Jump
+    // Left Trigger → Jump
+    if (pad.leftTrigger.value > 0.3f) {
+        Key_Event(K_SPACE, 1);
     } else {
         Key_Event(K_SPACE, 0);
     }
+    
+    // A → Jump (alternate)
+    Key_Event(K_SPACE, pad.buttonA.isPressed ? 1 : 0);
+    
+    // Y → Next weapon (impulse 10)
+    {
+        static BOOL lastY = NO;
+        if (pad.buttonY.isPressed && !lastY) {
+            Key_Event('/', 1); Key_Event('/', 0);  // bound to impulse 10
+        }
+        lastY = pad.buttonY.isPressed;
+    }
+    
+    // B → Swim down / crouch
+    Key_Event('c', pad.buttonB.isPressed ? 1 : 0);
+    
+    // X → Use / open doors (impulse)
+    {
+        static BOOL lastX = NO;
+        if (pad.buttonX.isPressed && !lastX) {
+            Key_Event(K_ENTER, 1); Key_Event(K_ENTER, 0);
+        }
+        lastX = pad.buttonX.isPressed;
+    }
+    
+    // Right Shoulder → Next weapon
+    {
+        static BOOL lastRB = NO;
+        if (pad.rightShoulder.isPressed && !lastRB) {
+            Key_Event('/', 1); Key_Event('/', 0);
+        }
+        lastRB = pad.rightShoulder.isPressed;
+    }
+    
+    // Left Shoulder → Previous weapon
+    {
+        static BOOL lastLB = NO;
+        if (pad.leftShoulder.isPressed && !lastLB) {
+            // Quake uses impulse 12 for prev weapon
+            Key_Event('.', 1); Key_Event('.', 0);
+        }
+        lastLB = pad.leftShoulder.isPressed;
+    }
+    
+    // Menu button → Escape (opens/closes menu)
+    if (pad.buttonMenu.isPressed) {
+        Key_Event(K_ESCAPE, 1);
+    } else {
+        Key_Event(K_ESCAPE, 0);
+    }
+    
+    // D-pad for movement
+    if (pad.dpad.up.isPressed)    Key_Event(K_UPARROW, 1); else Key_Event(K_UPARROW, 0);
+    if (pad.dpad.down.isPressed)  Key_Event(K_DOWNARROW, 1); else Key_Event(K_DOWNARROW, 0);
+    if (pad.dpad.left.isPressed)  Key_Event(K_LEFTARROW, 1); else Key_Event(K_LEFTARROW, 0);
+    if (pad.dpad.right.isPressed) Key_Event(K_RIGHTARROW, 1); else Key_Event(K_RIGHTARROW, 0);
 }
 
 extern "C" void IN_Move(usercmd_t *cmd) {

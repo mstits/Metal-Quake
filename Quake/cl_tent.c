@@ -202,6 +202,15 @@ void CL_ParseTEnt (void)
 		dl->die = cl.time + 0.5;
 		dl->decay = 300;
 		S_StartSound (-1, 0, cl_sfx_r_exp3, pos, 1, 1);
+
+		// Metal Quake: distance-attenuated explosion haptic
+		{
+			extern void IN_PlayExplosionHaptic(float distance);
+			vec3_t diff;
+			VectorSubtract(pos, cl_entities[cl.viewentity].origin, diff);
+			float dist = sqrt(diff[0]*diff[0] + diff[1]*diff[1] + diff[2]*diff[2]);
+			IN_PlayExplosionHaptic(dist);
+		}
 		break;
 		
 	case TE_TAREXPLOSION:			// tarbaby explosion

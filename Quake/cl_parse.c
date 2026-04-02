@@ -310,6 +310,12 @@ void CL_ParseServerInfo (void)
 	
 	R_NewMap ();
 
+	// Metal Quake: rebuild PHASE occlusion geometry for new map
+	{
+		extern void MQ_PHASE_BuildOcclusionFromBSP(void);
+		MQ_PHASE_BuildOcclusionFromBSP();
+	}
+
 	Hunk_Check ();		// make sure nothing is hurt
 	
 	noclip_anglehack = false;		// noclip is turned off at start	
