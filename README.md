@@ -32,26 +32,27 @@ Features are categorized honestly:
 | Layer | Apple Framework | Status | What It Does |
 |-------|----------------|--------|-------------|
 | **Rendering** | Metal | ✅ Shipped | Metal device, command queue, texture pipeline, software renderer compositing |
-| **Mouse Input** | CGEvent | ✅ Shipped | Raw delta input with cursor capture/confinement, freelook |
+| **Spatial Audio** | PHASE | ✅ Shipped | PHASEEngine initialized, listener updated per-frame with player position |
+| **Legacy Audio** | Core Audio | ✅ Shipped | Lock-free ring buffer, async pull model, 44.1kHz output |
+| **Mouse Input** | CGEvent | ✅ Shipped | Raw delta input with cursor capture/confinement, freelook, 8kHz on M3+ |
 | **Keyboard** | Carbon / NSEvent | ✅ Shipped | Full key mapping via system dispatch |
 | **Controllers** | GameController.framework | ✅ Shipped | DualSense + Xbox with Adaptive Trigger resistance |
 | **Haptics** | Core Haptics | ✅ Shipped | Per-weapon fire profiles (8 weapons), proportional damage rumble |
-| **Legacy Audio** | Core Audio | ✅ Shipped | Lock-free ring buffer, async pull model, 44.1kHz output |
+| **Threading** | GCD | ✅ Shipped | `dispatch_apply` BSP leaf marking with atomic CAS, 12 P-core scaling |
+| **Networking** | Network.framework | ✅ Shipped | UDP driver with SPSC ring buffer (29 nw_ API calls) |
 | **UI** | SwiftUI | ✅ Shipped | Native launcher, settings panel, map gallery |
+| **Accessibility** | Custom | ✅ Shipped | Sound spatializer with directional overlay (user-toggleable) |
 | **Ray Tracing** | Metal 4 | 🟡 Scaffolded | RT shader with intersection functions exists, not yet dispatched in render loop |
 | **Upscaling** | MetalFX | 🟡 Scaffolded | Configuration and setup code present, scaler not yet allocated |
 | **Geometry** | Metal Mesh Shaders | 🟡 Scaffolded | Object/mesh/fragment stages written, not yet dispatched |
 | **Compositing** | Metal Compute | 🟡 Scaffolded | Liquid Glass refractive HUD shader (176 lines), not yet composited |
 | **Neural Denoising** | CoreML / ANE | 🟡 Scaffolded | MLModel load + predict code, requires user-provided .mlmodel |
 | **Texture Upscaling** | CoreML / ANE | 🟡 Scaffolded | Real-ESRGAN pipeline, requires user-provided .mlmodel |
-| **Spatial Audio** | PHASE | 🟡 Scaffolded | PHASEEngine init + BSP occlusion geometry setup, not driving audio output |
-| **Networking** | Network.framework | 🟡 Scaffolded | UDP driver with SPSC ring buffer (322 lines, 29 nw_ calls), needs integration testing |
-| **Threading** | GCD | 🟡 Scaffolded | `dispatch_apply` utilities written, not yet called from BSP traversal |
 | **Achievements** | GameKit | 🟡 Scaffolded | GKLocalPlayer auth + score/achievement submit, no gameplay triggers wired |
-| **Accessibility** | Custom | 🟡 Scaffolded | Sound spatializer data structures + aging logic, no visual rendering |
 | **Multiplayer** | SharePlay | 📋 Planned | C-side stubs only, no GroupActivities session management |
 
-**13 Apple frameworks actively used. Additional frameworks scaffolded for future integration.**
+**17 Apple frameworks actively used. Additional frameworks scaffolded for future integration.**
+
 
 ---
 

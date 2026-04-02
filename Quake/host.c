@@ -707,6 +707,14 @@ void _Host_Frame (float time)
 	{
 		S_Update (r_origin, vpn, vright, vup);
 		CL_DecayLights ();
+
+		// Metal Quake: update PHASE listener + spatializer
+		{
+			extern void MQ_PHASE_UpdateListener(float origin[3], float forward[3], float right[3], float up[3]);
+			extern void MQ_Spatializer_Update(float dt);
+			MQ_PHASE_UpdateListener(r_origin, vpn, vright, vup);
+			MQ_Spatializer_Update(host_frametime);
+		}
 	}
 	else
 		S_Update (vec3_origin, vec3_origin, vec3_origin, vec3_origin);
@@ -895,6 +903,18 @@ void Host_Init (quakeparms_t *parms)
 
 		S_Init ();
 
+		// Metal Quake: initialize Apple subsystems
+		{
+			extern void MQ_PHASE_Init(void);
+			extern void MQ_HighFreqMouse_Init(void);
+			extern void MQ_SharePlay_Init(void);
+			extern void MQ_Spatializer_Enable(int enable);
+			MQ_PHASE_Init();
+			MQ_HighFreqMouse_Init();
+			MQ_SharePlay_Init();
+			MQ_Spatializer_Enable(0); // off by default, user can enable
+		}
+
 		CDAudio_Init ();
 		Sbar_Init ();
 		CL_Init ();
@@ -939,6 +959,15 @@ void Host_Shutdown(void)
 	CDAudio_Shutdown ();
 	NET_Shutdown ();
 	S_Shutdown();
+
+	// Metal Quake: shutdown Apple subsystems
+	{
+		extern void MQ_PHASE_Shutdown(void);
+		extern void MQ_TasksShutdown(void);
+		MQ_PHASE_Shutdown();
+		MQ_TasksShutdown();
+	}
+
 	IN_Shutdown ();
 
 	if (cls.state != ca_dedicated)
