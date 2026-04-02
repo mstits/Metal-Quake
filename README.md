@@ -35,7 +35,7 @@ Features are categorized honestly:
 | **Ray Tracing** | Metal RT | Shipped | BLAS from BSP geometry, RT intersection, dynamic GI + emissive surfaces |
 | **Upscaling** | MetalFX | Shipped | Display scaling from internal resolution |
 | **Legacy Audio** | Core Audio | Shipped | Lock-free ring buffer, async pull model |
-| **Spatial Audio** | PHASE | Shipped | Per-frame listener position update (dual-engine alongside Core Audio) |
+| **Spatial Audio** | PHASE | In Motion | Engine + listener + source scaffolded; deferred at runtime (see Known Issues) |
 | **Mouse Input** | CGEvent | Shipped | Raw delta input, continuous cursor warping, robust focus survival |
 | **Keyboard** | Carbon / NSEvent | Shipped | Full key mapping |
 | **Controllers** | GameController | Shipped | DualSense + Xbox — sticks, triggers, D-pad |
@@ -90,7 +90,7 @@ graph TB
 
     subgraph "Audio"
         CoreAudio["Core Audio (active)"]
-        PHASE["PHASE (active)"]
+        PHASE["PHASE (deferred)"]
         Haptics["Core Haptics (active)"]
     end
 
@@ -188,6 +188,25 @@ Every weapon has a distinct haptic profile tuned for its feel:
 | Lightning Gun | 0.5 | 1.0 | 20ms | Sustained buzz |
 
 Damage feedback scales proportionally. Nearby explosions produce distance-attenuated low-frequency feedback.
+
+---
+
+## Known Issues
+
+### PHASE Spatial Audio — Deferred at Runtime
+
+**Status:** PHASE engine initialization is compiled in but skipped at launch. Core Audio handles all mixing.
+
+**Root Cause:** Apple's PHASE framework throws unrecoverable `NSException`s on its internal audio rendering threads when `PHASESource` objects are created and attached to the scene graph without prior sound event registration. Quake's audio model is fire-and-forget (`S_StartSound` with a channel/entity/origin) — there is no concept of pre-registered sound events or audio assets bound to sources ahead of time.
+
+When a PHASE source is created on-the-fly during gameplay (particularly during water entry, where multiple overlapping ambient sounds fire simultaneously), the framework's internal validation raises an exception on a thread we don't control. Because the exception originates inside PHASE's own render loop — not in our calling code — standard `@try/@catch` blocks around our API calls cannot intercept it. The result is either `SIGABRT` (crash) or a frozen main thread waiting on a dead audio thread.
+
+**What's Needed:** A proper PHASE integration requires:
+1. Pre-registering all Quake `.wav` assets as `PHASESoundEvent` definitions at map load time
+2. Binding sound events to sources before attaching sources to the scene graph
+3. Using PHASE's pull-model audio pipeline instead of Quake's push-model `S_StartSound`
+
+This is a non-trivial architectural change and is tracked for a future milestone.
 
 ---
 

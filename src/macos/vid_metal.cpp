@@ -135,6 +135,7 @@ static MTL::Buffer* _pTriTexInfoBuffer = nullptr;
 static MTL::Buffer* _pDynLightBuffer = nullptr;
 static MTL::ComputePipelineState* _pDenoiseState = nullptr; // GPU bilateral denoiser
 static MTL::Texture* _pDenoiseScratch = nullptr; // Ping-pong scratch for denoiser
+static MTL::Texture* _pMFXOutputTexture = nullptr; // MetalFX upscaled output
 
 // Previous frame camera state for motion vector generation
 static float _prevCamOrigin[4] = {0};
@@ -866,16 +867,41 @@ static void BuildPipeline() {
             }
         }
 
+        // Packed uniforms: screenBlend + time + flags + resolution
+        struct PostFXUniforms {
+            float4 screenBlend;
+            float  time;
+            float  underwater;     // 1.0 = in water/slime/lava
+            float  crt_mode;       // 1.0 = CRT scanline filter
+            float  liquid_glass;   // 1.0 = frosted glass HUD
+            float2 resolution;     // output resolution (pixels)
+            float  ssao_enabled;   // 1.0 = SSAO
+            float  edr_enabled;    // 1.0 = Extended Dynamic Range
+        };
+
         fragment float4 fragmentMain(VertexOut in [[stage_in]],
                                    texture2d<uint> indexTex [[texture(0)]],
                                    texture2d<float> paletteTex [[texture(1)]],
                                    texture2d<float> rtTex [[texture(2)]],
                                    texture2d<float> depthTex [[texture(3)]],
-                                   constant float4& screenBlend [[buffer(0)]]) {
+                                   constant PostFXUniforms& u [[buffer(0)]]) {
             if (in.texCoord.x > 1.0 || in.texCoord.y > 1.0) discard_fragment();
             
+            // 0. Underwater warp — sine-wave UV distortion (replaces D_WarpScreen)
+            float2 uv = in.texCoord;
+            if (u.underwater > 0.5) {
+                float t = u.time;
+                float warpX = sin(uv.y * 20.0 + t * 4.0) * 0.005;
+                float warpY = cos(uv.x * 20.0 + t * 3.5) * 0.005;
+                // Second octave for organic feel
+                warpX += sin(uv.y * 40.0 - t * 2.5) * 0.002;
+                warpY += cos(uv.x * 35.0 + t * 3.0) * 0.002;
+                uv += float2(warpX, warpY);
+                uv = clamp(uv, 0.001, 0.999);
+            }
+            
             // 1. Get base color
-            float3 color = getPixelColor(in.texCoord, indexTex, paletteTex, rtTex);
+            float3 color = getPixelColor(uv, indexTex, paletteTex, rtTex);
             
             // 2. High-Quality Bloom & Adaptive Sharpen
             float3 bloomAccum = float3(0);
@@ -946,9 +972,115 @@ static void BuildPipeline() {
             vig = saturate(vig * vig);
             color *= mix(0.65, 1.0, vig);
             
+            // 5.5. SSAO — Screen-Space Ambient Occlusion from RT depth
+            if (u.ssao_enabled > 0.5) {
+                constexpr sampler ssaoSamp(filter::linear);
+                float centerDepth = depthTex.sample(ssaoSamp, in.texCoord).r;
+                if (centerDepth > 0.01 && centerDepth < 9000.0) {
+                    float occlusion = 0.0;
+                    float radius = 0.015; // screen-space radius
+                    // 8-sample hemisphere kernel with hash-based per-pixel rotation
+                    float hashVal = fract(sin(dot(in.texCoord * u.resolution, float2(12.9898, 78.233))) * 43758.5453);
+                    float rotAngle = hashVal * 6.28318;
+                    float cosR = cos(rotAngle), sinR = sin(rotAngle);
+                    // Unrolled 8-sample kernel
+                    float2 ssaoOffsets[8];
+                    ssaoOffsets[0] = float2( 0.35, 0.15); ssaoOffsets[1] = float2(-0.20, 0.40);
+                    ssaoOffsets[2] = float2( 0.50,-0.25); ssaoOffsets[3] = float2(-0.10,-0.45);
+                    ssaoOffsets[4] = float2( 0.15, 0.50); ssaoOffsets[5] = float2(-0.45, 0.10);
+                    ssaoOffsets[6] = float2( 0.25,-0.40); ssaoOffsets[7] = float2(-0.30,-0.20);
+                    for (int si = 0; si < 8; si++) {
+                        float2 k = ssaoOffsets[si];
+                        // Rotate sample point
+                        float2 rotK = float2(k.x * cosR - k.y * sinR, k.x * sinR + k.y * cosR);
+                        float2 sampleUV = in.texCoord + rotK * radius;
+                        sampleUV = clamp(sampleUV, 0.001, 0.999);
+                        float sampleDepth = depthTex.sample(ssaoSamp, sampleUV).r;
+                        // Range-checked occlusion
+                        float rangeCheck = smoothstep(0.0, 1.0, radius * 200.0 / max(abs(centerDepth - sampleDepth), 0.001));
+                        occlusion += (sampleDepth < centerDepth - 0.5 ? 1.0 : 0.0) * rangeCheck;
+                    }
+                    occlusion = 1.0 - (occlusion / 8.0) * 0.6; // 60% max darkening
+                    color *= occlusion;
+                }
+            }
+            
             // 7. Screen Blends (damage flashes, underwater, powerups)
-            if (screenBlend.w > 0.001) {
-                color = mix(color, screenBlend.rgb, screenBlend.w);
+            if (u.screenBlend.w > 0.001) {
+                color = mix(color, u.screenBlend.rgb, u.screenBlend.w);
+            }
+            
+            // 8. CRT Scanline Filter — retro monitor emulation
+            if (u.crt_mode > 0.5) {
+                float2 crtUV = in.texCoord;
+                // Barrel distortion (subtle CRT curvature)
+                float2 dc = crtUV - 0.5;
+                float r2 = dot(dc, dc);
+                crtUV = crtUV + dc * r2 * 0.08;
+                
+                // Scanlines — darken every other physical pixel row
+                float scanline = sin(crtUV.y * u.resolution.y * 3.14159) * 0.5 + 0.5;
+                scanline = pow(scanline, 1.5) * 0.15 + 0.85; // 15% darkening
+                color *= scanline;
+                
+                // Phosphor sub-pixel tint (RGB columns)
+                int col = int(crtUV.x * u.resolution.x) % 3;
+                float3 phosphor = float3(col == 0 ? 1.2 : 0.9,
+                                         col == 1 ? 1.2 : 0.9,
+                                         col == 2 ? 1.2 : 0.9);
+                color *= phosphor;
+                
+                // Edge vignette glow (warm CRT border)
+                float crtVig = 1.0 - smoothstep(0.4, 0.52, length(dc));
+                color *= crtVig;
+                
+                // Slight bloom on bright pixels for phosphor glow
+                float lum = dot(color, float3(0.2126, 0.7152, 0.0722));
+                if (lum > 0.7) color += (color - 0.7) * 0.3;
+            }
+            
+            // 9. Liquid Glass HUD — frosted glass overlay on status bar
+            if (u.liquid_glass > 0.5) {
+                float2 hudUV = in.texCoord;
+                float hudMask = smoothstep(0.82, 0.85, hudUV.y);
+                if (hudMask > 0.01) {
+                    // Frosted blur (5-tap weighted)
+                    float2 texelSz = 1.0 / u.resolution;
+                    float3 blurred = color * 0.375;
+                    blurred += getPixelColor(hudUV + float2( texelSz.x * 2.0, 0), indexTex, paletteTex, rtTex) * 0.15625;
+                    blurred += getPixelColor(hudUV + float2(-texelSz.x * 2.0, 0), indexTex, paletteTex, rtTex) * 0.15625;
+                    blurred += getPixelColor(hudUV + float2(0,  texelSz.y * 2.0), indexTex, paletteTex, rtTex) * 0.15625;
+                    blurred += getPixelColor(hudUV + float2(0, -texelSz.y * 2.0), indexTex, paletteTex, rtTex) * 0.15625;
+                    
+                    // Cool blue-white glass tint
+                    float3 glassTint = blurred * float3(0.92, 0.95, 1.08) + float3(0.03, 0.04, 0.06);
+                    
+                    // Animated specular edge highlight (ribbon of light)
+                    float edgeGlow = smoothstep(0.83, 0.855, hudUV.y) * (1.0 - smoothstep(0.855, 0.87, hudUV.y));
+                    float ribbon = sin(hudUV.x * 30.0 + u.time * 1.5) * 0.5 + 0.5;
+                    glassTint += float3(0.15) * edgeGlow * ribbon;
+                    
+                    // Chromatic aberration at glass edge
+                    float chromaEdge = edgeGlow * 0.003;
+                    if (chromaEdge > 0.0001) {
+                        glassTint.r = getPixelColor(hudUV + float2(chromaEdge, 0), indexTex, paletteTex, rtTex).r * 0.92 + 0.03;
+                        glassTint.b = getPixelColor(hudUV - float2(chromaEdge, 0), indexTex, paletteTex, rtTex).b * 1.08 + 0.06;
+                    }
+                    
+                    color = mix(color, glassTint, hudMask * 0.7);
+                }
+            }
+            
+            // 10. EDR — Extended Dynamic Range output for XDR displays
+            if (u.edr_enabled > 0.5) {
+                // Allow values > 1.0 for HDR headroom on XDR panels
+                // Apply a subtle highlight expansion: brightest pixels can reach 2.0
+                float peakLum = max(max(color.r, color.g), color.b);
+                if (peakLum > 0.8) {
+                    float expansion = 1.0 + (peakLum - 0.8) * 2.5; // 0.8→1.0, 1.0→1.5
+                    color *= expansion / max(peakLum, 0.001) * peakLum;
+                }
+                return float4(max(color, float3(0.0)), 1.0);
             }
             
             return float4(saturate(color), 1.0);
@@ -1343,46 +1475,74 @@ extern "C" void Draw_String(int x, int y, char *str);
 extern "C" void Sys_SetWindowSize(int width, int height);
 
 static int _vidMenuCursor = 0;
+static const char* _mfxModeNames[] = { "OFF", "Spatial", "Temporal" };
+
 static void VID_MenuDraw(void) {
     extern cvar_t sensitivity;
     extern cvar_t sv_aim;
+    MetalQuakeSettings* s = MQ_GetSettings();
     Draw_String(72, 32, (char*)"Video Options (Metal)");
-    const int itemY[] = { 64, 76, 88, 100, 120 };
-    const char* itemLabels[] = { "Resolution:", "Raytracing:", "Sensitivity:", "Auto-aim:", "Apply" };
-    for (int i = 0; i < 5; i++) {
+    const int itemY[] = { 52, 64, 76, 88, 100, 112, 124, 136, 148, 160, 172, 192 };
+    const char* itemLabels[] = { "Resolution:", "Raytracing:", "MetalFX:", "Denoise:",
+                                  "SSAO:", "EDR/HDR:", "Sensitivity:", "Auto-aim:",
+                                  "CRT Mode:", "Liquid Glass:", "Underwater FX:", "Apply" };
+    for (int i = 0; i < 12; i++) {
         if (i == _vidMenuCursor) Draw_Character(56, itemY[i], 12 + ((int)(realtime * 4) & 1));
         Draw_String(72, itemY[i], (char*)itemLabels[i]);
     }
-    Draw_String(168, 64, (char*)vid_modes[vid_mode]);
-    Draw_String(168, 76, (char*)(vid_rtx.value ? "ON" : "OFF"));
+    Draw_String(180, 52, (char*)vid_modes[vid_mode]);
+    Draw_String(180, 64, (char*)(vid_rtx.value ? "ON" : "OFF"));
+    Draw_String(180, 76, (char*)_mfxModeNames[s->metalfx_mode]);
+    Draw_String(180, 88, (char*)(s->neural_denoise ? "ON" : "OFF"));
+    Draw_String(180, 100, (char*)(s->ssao_enabled ? "ON" : "OFF"));
+    Draw_String(180, 112, (char*)(s->edr_enabled ? "ON" : "OFF"));
     char sensStr[16]; snprintf(sensStr, sizeof(sensStr), "%.1f", sensitivity.value);
-    Draw_String(168, 88, sensStr);
-    Draw_String(168, 100, (char*)(sv_aim.value < 1.0 ? "ON" : "OFF"));
+    Draw_String(180, 124, sensStr);
+    Draw_String(180, 136, (char*)(sv_aim.value < 1.0 ? "ON" : "OFF"));
+    Draw_String(180, 148, (char*)(s->crt_mode ? "ON" : "OFF"));
+    Draw_String(180, 160, (char*)(s->liquid_glass_ui ? "ON" : "OFF"));
+    Draw_String(180, 172, (char*)(s->underwater_fx ? "ON" : "OFF"));
 }
 
 static void VID_MenuKey(int key) {
     extern cvar_t sensitivity;
     extern cvar_t sv_aim;
+    MetalQuakeSettings* s = MQ_GetSettings();
     if (key == K_ESCAPE) { 
         extern keydest_t key_dest; extern int m_state;
         key_dest = key_game; m_state = 0;
         return; 
     }
-    if (key == K_UPARROW) { _vidMenuCursor--; if (_vidMenuCursor < 0) _vidMenuCursor = 4; }
-    else if (key == K_DOWNARROW) { _vidMenuCursor++; if (_vidMenuCursor > 4) _vidMenuCursor = 0; }
+    if (key == K_UPARROW) { _vidMenuCursor--; if (_vidMenuCursor < 0) _vidMenuCursor = 11; }
+    else if (key == K_DOWNARROW) { _vidMenuCursor++; if (_vidMenuCursor > 11) _vidMenuCursor = 0; }
     if (_vidMenuCursor == 0) {
         if (key == K_LEFTARROW) { vid_mode--; if (vid_mode < 0) vid_mode = 4; }
         else if (key == K_RIGHTARROW) { vid_mode++; if (vid_mode > 4) vid_mode = 0; }
     } else if (_vidMenuCursor == 1) {
         if (key == K_LEFTARROW || key == K_RIGHTARROW || key == K_ENTER) Cvar_SetValue("vid_rtx", vid_rtx.value ? 0 : 1);
     } else if (_vidMenuCursor == 2) {
-        if (key == K_LEFTARROW) { float s = sensitivity.value - 0.5; if (s < 1.0) s = 1.0; Cvar_SetValue("sensitivity", s); }
-        else if (key == K_RIGHTARROW) { float s = sensitivity.value + 0.5; if (s > 20.0) s = 20.0; Cvar_SetValue("sensitivity", s); }
+        if (key == K_RIGHTARROW || key == K_ENTER) { s->metalfx_mode = (MQMetalFXMode)(((int)s->metalfx_mode + 1) % 3); }
+        else if (key == K_LEFTARROW) { s->metalfx_mode = (MQMetalFXMode)(((int)s->metalfx_mode + 2) % 3); }
     } else if (_vidMenuCursor == 3) {
+        if (key == K_LEFTARROW || key == K_RIGHTARROW || key == K_ENTER) s->neural_denoise = !s->neural_denoise;
+    } else if (_vidMenuCursor == 4) {
+        if (key == K_LEFTARROW || key == K_RIGHTARROW || key == K_ENTER) s->ssao_enabled = !s->ssao_enabled;
+    } else if (_vidMenuCursor == 5) {
+        if (key == K_LEFTARROW || key == K_RIGHTARROW || key == K_ENTER) s->edr_enabled = !s->edr_enabled;
+    } else if (_vidMenuCursor == 6) {
+        if (key == K_LEFTARROW) { float sv = sensitivity.value - 0.5; if (sv < 1.0) sv = 1.0; Cvar_SetValue("sensitivity", sv); }
+        else if (key == K_RIGHTARROW) { float sv = sensitivity.value + 0.5; if (sv > 20.0) sv = 20.0; Cvar_SetValue("sensitivity", sv); }
+    } else if (_vidMenuCursor == 7) {
         if (key == K_LEFTARROW || key == K_RIGHTARROW || key == K_ENTER) {
             Cvar_SetValue("sv_aim", sv_aim.value < 1.0 ? 1.0 : 0.93);
         }
-    } else if (_vidMenuCursor == 4) {
+    } else if (_vidMenuCursor == 8) {
+        if (key == K_LEFTARROW || key == K_RIGHTARROW || key == K_ENTER) s->crt_mode = !s->crt_mode;
+    } else if (_vidMenuCursor == 9) {
+        if (key == K_LEFTARROW || key == K_RIGHTARROW || key == K_ENTER) s->liquid_glass_ui = !s->liquid_glass_ui;
+    } else if (_vidMenuCursor == 10) {
+        if (key == K_LEFTARROW || key == K_RIGHTARROW || key == K_ENTER) s->underwater_fx = !s->underwater_fx;
+    } else if (_vidMenuCursor == 11) {
         if (key == K_ENTER) Sys_SetWindowSize(vid_mode_ws[vid_mode], vid_mode_hs[vid_mode]);
     }
 }
@@ -1450,6 +1610,12 @@ extern "C" void VID_Init(unsigned char *palette) {
     _pTemporalScaler = pTempDesc->newTemporalScaler(_pDevice);
     if (_pTemporalScaler) Con_Printf("MetalFX: Temporal scaler created (%dx%d → %dx%d)\n", rtW, rtH, w, h);
     else Con_Printf("MetalFX: Temporal scaler FAILED\n");
+    // MetalFX upscaled output texture (window resolution)
+    auto* pMFXOutDesc = MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatBGRA8Unorm, w, h, false);
+    pMFXOutDesc->setUsage(MTL::TextureUsageShaderWrite | MTL::TextureUsageShaderRead);
+    pMFXOutDesc->setStorageMode(MTL::StorageModePrivate);
+    _pMFXOutputTexture = _pDevice->newTexture(pMFXOutDesc);
+    if (_pMFXOutputTexture) Con_Printf("MetalFX: Output texture created (%dx%d)\n", w, h);
     // --- GPU Bilateral Denoiser (inline Metal compute shader) ---
     // À-trous wavelet filter: edge-aware spatial denoising for noisy RT output
     {
@@ -1611,14 +1777,35 @@ extern "C" void VID_Update(vrect_t *rects) {
                 pBlit->endEncoding();
             }
         }
+
+        // MetalFX Temporal Upscaling — after denoise, before compositor
+        if (_pTemporalScaler && _pMFXOutputTexture && _pRTDepthTexture && _pRTMotionTexture &&
+            MQ_GetSettings()->metalfx_mode == MQ_METALFX_TEMPORAL) {
+            // Halton(2,3) jitter sequence for temporal stability
+            static const float haltonX[] = {0.5f, 0.25f, 0.75f, 0.125f, 0.625f, 0.375f, 0.875f, 0.0625f};
+            static const float haltonY[] = {0.333f, 0.667f, 0.111f, 0.444f, 0.778f, 0.222f, 0.556f, 0.889f};
+            int jIdx = _frameIndex % 8;
+            _pTemporalScaler->setColorTexture(_pRTOutputTexture);
+            _pTemporalScaler->setDepthTexture(_pRTDepthTexture);
+            _pTemporalScaler->setMotionTexture(_pRTMotionTexture);
+            _pTemporalScaler->setOutputTexture(_pMFXOutputTexture);
+            _pTemporalScaler->setInputContentWidth(_pRTOutputTexture->width());
+            _pTemporalScaler->setInputContentHeight(_pRTOutputTexture->height());
+            _pTemporalScaler->setJitterOffsetX(haltonX[jIdx] - 0.5f);
+            _pTemporalScaler->setJitterOffsetY(haltonY[jIdx] - 0.5f);
+            _pTemporalScaler->setReset(_temporalReset);
+            _pTemporalScaler->encodeToCommandBuffer(pCmd);
+        }
     }
     auto* pRpd = MTL::RenderPassDescriptor::alloc()->init();
     // Render directly into the drawable — GPU texture sampling upscales 320x240 → 640x480
     pRpd->colorAttachments()->object(0)->setTexture(pDrawable->texture()); pRpd->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionDontCare); pRpd->colorAttachments()->object(0)->setStoreAction(MTL::StoreActionStore);
     auto* pEnc = pCmd->renderCommandEncoder(pRpd);
     pEnc->setRenderPipelineState(_pPipelineState); pEnc->setFragmentTexture(pCurrentIdxTex, 0); pEnc->setFragmentTexture(_pPaletteTexture, 1); pEnc->setFragmentTexture(_pRTOutputTexture, 2); pEnc->setFragmentTexture(_pRTDepthTexture, 3);
-    // Compute screen blend from Quake's cshift system
-    float screenBlend[4] = {0, 0, 0, 0};
+    // Compute PostFX uniforms: screen blend + time + underwater + CRT + Liquid Glass
+    struct { float screenBlend[4]; float time; float underwater; float crt_mode; float liquid_glass;
+             float resolution[2]; float ssao_enabled; float edr_enabled; } postfx;
+    memset(&postfx, 0, sizeof(postfx));
     {
         float r = 0, g = 0, b = 0, a = 0;
         for (int j = 0; j < NUM_CSHIFTS; j++) {
@@ -1632,12 +1819,23 @@ extern "C" void VID_Update(vrect_t *rects) {
                 b = b * (1.0f - blend) + cl.cshifts[j].destcolor[2] * blend;
             }
         }
-        screenBlend[0] = r / 255.0f;
-        screenBlend[1] = g / 255.0f;
-        screenBlend[2] = b / 255.0f;
-        screenBlend[3] = a > 1.0f ? 1.0f : (a < 0 ? 0 : a);
+        postfx.screenBlend[0] = r / 255.0f;
+        postfx.screenBlend[1] = g / 255.0f;
+        postfx.screenBlend[2] = b / 255.0f;
+        postfx.screenBlend[3] = a > 1.0f ? 1.0f : (a < 0 ? 0 : a);
     }
-    pEnc->setFragmentBytes(screenBlend, sizeof(screenBlend), 0);
+    postfx.time = (float)realtime;
+    // Check if player's view leaf is underwater AND the setting is enabled
+    extern mleaf_t *r_viewleaf;
+    postfx.underwater = (MQ_GetSettings()->underwater_fx &&
+                         r_viewleaf && r_viewleaf->contents <= CONTENTS_WATER) ? 1.0f : 0.0f;
+    postfx.crt_mode = MQ_GetSettings()->crt_mode ? 1.0f : 0.0f;
+    postfx.liquid_glass = MQ_GetSettings()->liquid_glass_ui ? 1.0f : 0.0f;
+    postfx.resolution[0] = (float)pDrawable->texture()->width();
+    postfx.resolution[1] = (float)pDrawable->texture()->height();
+    postfx.ssao_enabled = MQ_GetSettings()->ssao_enabled ? 1.0f : 0.0f;
+    postfx.edr_enabled = MQ_GetSettings()->edr_enabled ? 1.0f : 0.0f;
+    pEnc->setFragmentBytes(&postfx, sizeof(postfx), 0);
     pEnc->drawPrimitives(MTL::PrimitiveTypeTriangle, (NS::UInteger)0, (NS::UInteger)3);
     pEnc->endEncoding(); pRpd->release();
     pCmd->presentDrawable(pDrawable); pCmd->addCompletedHandler([](MTL::CommandBuffer* pCmd) { dispatch_semaphore_signal(_frameSemaphore); });

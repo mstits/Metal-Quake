@@ -11,6 +11,7 @@ extern "C" {
 
 #include <AudioUnit/AudioUnit.h>
 #include <AudioToolbox/AudioToolbox.h>
+#include <Accelerate/Accelerate.h>
 #include <atomic>
 #include <algorithm>
 #include "snd_coreaudio.hpp"

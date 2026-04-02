@@ -75,18 +75,18 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 // fall over
 #define ROLL 2
 
-#define MAX_QPATH 64   // max length of a quake game pathname
-#define MAX_OSPATH 128 // max length of a filesystem pathname
+#define MAX_QPATH 64    // max length of a quake game pathname
+#define MAX_OSPATH 1024 // max length of a filesystem pathname (arm64/macOS)
 
 #define ON_EPSILON 0.1 // point on plane side epsilon
 
-#define MAX_MSGLEN 8000   // max length of a reliable message
-#define MAX_DATAGRAM 1024 // max length of unreliable message
+#define MAX_MSGLEN 32000  // max length of a reliable message
+#define MAX_DATAGRAM 4096 // max length of unreliable message
 
 //
 // per-level limits
 //
-#define MAX_EDICTS 600 // FIXME: ouch! ouch! ouch!
+#define MAX_EDICTS 2048 // arm64: 3.4× original, L2 cache friendly
 #define MAX_LIGHTSTYLES 64
 #define MAX_MODELS 256 // these are sent over the net as bytes
 #define MAX_SOUNDS 256 // so they cannot be blindly increased

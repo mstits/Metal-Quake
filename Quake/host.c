@@ -262,6 +262,12 @@ void Host_WriteConfiguration (void)
 		Cvar_WriteVariables (f);
 
 		fclose (f);
+
+		// Metal Quake: persist settings
+		{
+			extern void MQ_SaveSettings(const char* path);
+			MQ_SaveSettings(va("%s/metal_quake.cfg", com_gamedir));
+		}
 	}
 }
 
@@ -915,6 +921,14 @@ void Host_Init (quakeparms_t *parms)
 			MQ_Spatializer_Enable(0); // off by default, user can enable
 		}
 
+		// Metal Quake: initialize settings
+		{
+			extern void MQ_InitSettings(void);
+			extern void MQ_LoadSettings(const char* path);
+			MQ_InitSettings();
+			MQ_LoadSettings(va("%s/metal_quake.cfg", com_gamedir));
+		}
+
 		CDAudio_Init ();
 		Sbar_Init ();
 		CL_Init ();
@@ -964,8 +978,10 @@ void Host_Shutdown(void)
 	{
 		extern void MQ_PHASE_Shutdown(void);
 		extern void MQ_TasksShutdown(void);
+		extern void MQ_CoreML_Shutdown(void);
 		MQ_PHASE_Shutdown();
 		MQ_TasksShutdown();
+		MQ_CoreML_Shutdown();
 	}
 
 	IN_Shutdown ();

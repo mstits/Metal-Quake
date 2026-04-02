@@ -94,6 +94,13 @@ void MQ_InitSettings(void) {
     s->high_contrast_hud   = 0;
     s->subtitles           = 0;
 
+    /* Post-Processing defaults */
+    s->crt_mode            = 0;
+    s->ssao_enabled        = 0;
+    s->chromatic_aberration = 0;
+    s->edr_enabled         = 0;
+    s->underwater_fx       = 1;  // ON by default — replaces legacy D_WarpScreen
+
     s->_dirty = 0;
 }
 
@@ -113,13 +120,14 @@ void MQ_ApplySettings(void) {
     Cvar_SetValue((char*)"sv_aim", s->auto_aim ? 0.93f : 1.0f);
     Cvar_SetValue((char*)"vid_rtx", s->rt_enabled ? 1.0f : 0.0f);
 
-    /**
-     * @todo Phase 2: Reconfigure Metal pipeline based on settings:
-     * - Rebuild RT compute PSO for quality level
-     * - Create/destroy MetalFX scaler based on mode
-     * - Switch audio engine (Core Audio ↔ PHASE)
-     * - Adjust internal render resolution
-     */
+    /* Audio mode: PHASE reads audio_mode from settings implicitly via
+       MQ_PHASE_IsEnabled(), which is checked in S_Update/S_StartSound.
+       No explicit enable/disable call needed — changing the setting is enough. */
+
+    /* Denoise: auto-enable on HIGH+ quality */
+    if (s->rt_quality >= MQ_RT_QUALITY_HIGH && !s->neural_denoise) {
+        s->neural_denoise = 1;
+    }
 
     s->_dirty = 0;
 }
@@ -145,6 +153,11 @@ void MQ_SaveSettings(const char* path) {
     fprintf(f, "invert_y %d\n", s->invert_y);
     fprintf(f, "coreml_textures %d\n", s->coreml_textures);
     fprintf(f, "sound_spatializer %d\n", s->sound_spatializer);
+    fprintf(f, "underwater_fx %d\n", s->underwater_fx);
+    fprintf(f, "crt_mode %d\n", s->crt_mode);
+    fprintf(f, "edr_enabled %d\n", s->edr_enabled);
+    fprintf(f, "ssao_enabled %d\n", s->ssao_enabled);
+    fprintf(f, "liquid_glass_ui %d\n", s->liquid_glass_ui);
 
     fclose(f);
 }
@@ -172,6 +185,11 @@ void MQ_LoadSettings(const char* path) {
         else if (strcmp(key, "invert_y") == 0)      s->invert_y = (int)val;
         else if (strcmp(key, "coreml_textures") == 0) s->coreml_textures = (int)val;
         else if (strcmp(key, "sound_spatializer") == 0) s->sound_spatializer = (int)val;
+        else if (strcmp(key, "underwater_fx") == 0)   s->underwater_fx = (int)val;
+        else if (strcmp(key, "crt_mode") == 0)         s->crt_mode = (int)val;
+        else if (strcmp(key, "edr_enabled") == 0)      s->edr_enabled = (int)val;
+        else if (strcmp(key, "ssao_enabled") == 0)     s->ssao_enabled = (int)val;
+        else if (strcmp(key, "liquid_glass_ui") == 0)  s->liquid_glass_ui = (int)val;
     }
 
     fclose(f);

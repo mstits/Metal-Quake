@@ -4,6 +4,7 @@
 #import <MetalKit/MetalKit.h>
 #import <Carbon/Carbon.h>
 #include <sys/stat.h>
+#include <mach/mach_time.h>
 #include "quakedef.h"
 
 @interface QuakeAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
@@ -199,13 +200,14 @@ void Sys_Quit(void) {
 }
 
 double Sys_FloatTime(void) {
-  static double start_time = -1.0;
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  double t = ts.tv_sec + ts.tv_nsec * 1e-9;
-  if (start_time < 0.0)
-    start_time = t;
-  return t - start_time;
+  static mach_timebase_info_data_t info = {0, 0};
+  static uint64_t start = 0;
+  if (info.denom == 0) {
+    mach_timebase_info(&info);
+    start = mach_continuous_time();
+  }
+  uint64_t now = mach_continuous_time();
+  return (double)(now - start) * (double)info.numer / (double)info.denom / 1e9;
 }
 
 char *Sys_ConsoleInput(void) { return NULL; }
@@ -308,7 +310,7 @@ int main(int argc, char **argv) {
       }
     }
 
-    parms.memsize = 32 * 1024 * 1024;
+    parms.memsize = 256 * 1024 * 1024;  // 256MB — Apple Silicon unified memory
     parms.membase = malloc(parms.memsize);
 
     Host_Init(&parms);

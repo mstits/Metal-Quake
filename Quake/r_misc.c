@@ -436,7 +436,10 @@ r_refdef.viewangles[2]=    0;
 	r_viewleaf = Mod_PointInLeaf (r_origin, cl.worldmodel);
 
 	r_dowarpold = r_dowarp;
-	r_dowarp = r_waterwarp.value && (r_viewleaf->contents <= CONTENTS_WATER);
+	// Force-disable warp rendering: the warp path renders to r_warpbuffer
+	// with mismatched viewport dimensions, generating edges with corrupt u
+	// values that create circular linked lists in R_InsertNewEdges.
+	r_dowarp = false;
 
 	if ((r_dowarp != r_dowarpold) || r_viewchanged || lcd_x.value)
 	{

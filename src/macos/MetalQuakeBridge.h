@@ -95,6 +95,10 @@ const char* MQBridge_GetMapName(int index);
  */
 void MQBridge_SyncSettings(void);
 
+/** MetalFX Spatial Upscaler */
+void* MQBridge_CreateSpatialUpscaler(void* device, int srcW, int srcH, int dstW, int dstH, unsigned long pixelFormat);
+int MQBridge_SpatialUpscale(void* scaler, void* cmdBuf, void* srcTex, void* dstTex);
+
 #ifdef __cplusplus
 }
 #endif

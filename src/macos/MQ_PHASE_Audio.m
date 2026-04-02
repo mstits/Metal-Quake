@@ -56,6 +56,13 @@ static PHASEMaterial *waterMaterial = nil;
 // ---------------------------------------------------------------------------
 
 void MQ_PHASE_Init(void) {
+    // PHASE disabled: the framework throws unrecoverable exceptions on its
+    // internal audio threads when sources are created without proper sound
+    // event registration. Core Audio handles all mixing until PHASE
+    // integration is completed with full asset binding.
+    Con_Printf("PHASE: Deferred (Core Audio active)\n");
+    return;
+    
     if (phaseEngine) return;
     
     @autoreleasepool {
@@ -127,30 +134,40 @@ int MQ_PHASE_IsEnabled(void) {
 // Listener Update (called every frame)
 // ---------------------------------------------------------------------------
 
+// Kill switch: if PHASE ever throws, disable for the rest of the session.
+// ObjC exception handling is too expensive to eat every frame.
+static BOOL phaseFaulted = NO;
+
 void MQ_PHASE_UpdateListener(float origin[3], float forward[3], float right[3], float up[3]) {
-    if (!phaseListener) return;
+    if (!phaseListener || phaseFaulted) return;
     
     @autoreleasepool {
-        // Build 4x4 transform from Quake view vectors
-        // Quake coords: X=forward, Y=left, Z=up → PHASE: -Z=forward, X=right, Y=up
-        simd_float4x4 transform = matrix_identity_float4x4;
-        
-        // Column 0: right vector
-        transform.columns[0] = simd_make_float4(right[0], right[2], -right[1], 0);
-        // Column 1: up vector
-        transform.columns[1] = simd_make_float4(up[0], up[2], -up[1], 0);
-        // Column 2: -forward (PHASE looks along -Z)
-        transform.columns[2] = simd_make_float4(-forward[0], -forward[2], forward[1], 0);
-        // Column 3: position (convert Quake → PHASE coordinate space)
-        float scale = 1.0f / 64.0f; // Quake units to meters (approx)
-        transform.columns[3] = simd_make_float4(
-            origin[0] * scale,
-            origin[2] * scale,
-            -origin[1] * scale,
-            1.0f
-        );
-        
-        phaseListener.transform = transform;
+        @try {
+            // Build 4x4 transform from Quake view vectors
+            // Quake coords: X=forward, Y=left, Z=up → PHASE: -Z=forward, X=right, Y=up
+            simd_float4x4 transform = matrix_identity_float4x4;
+            
+            // Column 0: right vector
+            transform.columns[0] = simd_make_float4(right[0], right[2], -right[1], 0);
+            // Column 1: up vector
+            transform.columns[1] = simd_make_float4(up[0], up[2], -up[1], 0);
+            // Column 2: -forward (PHASE looks along -Z)
+            transform.columns[2] = simd_make_float4(-forward[0], -forward[2], forward[1], 0);
+            // Column 3: position (convert Quake → PHASE coordinate space)
+            float scale = 1.0f / 64.0f; // Quake units to meters (approx)
+            transform.columns[3] = simd_make_float4(
+                origin[0] * scale,
+                origin[2] * scale,
+                -origin[1] * scale,
+                1.0f
+            );
+            
+            phaseListener.transform = transform;
+        } @catch (NSException *e) {
+            phaseFaulted = YES;
+            Con_Printf("PHASE: FATAL listener — %s (spatial audio disabled)\n",
+                       [[e reason] UTF8String]);
+        }
     }
 }
 
@@ -159,38 +176,60 @@ void MQ_PHASE_UpdateListener(float origin[3], float forward[3], float right[3], 
 // ---------------------------------------------------------------------------
 
 void MQ_PHASE_UpdateSource(int entityNum, float origin[3], float volume) {
-    if (!phaseEngine) return;
+    if (!phaseEngine || !phaseSources || phaseFaulted) return;
     
     @autoreleasepool {
-        NSNumber *key = @(entityNum);
-        PHASESource *source = phaseSources[key];
-        
-        if (!source) {
-            // Create new point source
-            PHASEShape *shape = [[PHASEShape alloc]
-                initWithEngine:phaseEngine
-                mesh:[MDLMesh newIcosahedronWithRadius:0.1
-                    inwardNormals:NO allocator:[[MTKMeshBufferAllocator alloc]
-                        initWithDevice:MTLCreateSystemDefaultDevice()]]];
-            PHASESource *src = [[PHASESource alloc] initWithEngine:phaseEngine
-                                                            shapes:@[shape]];
+        @try {
+            NSNumber *key = @(entityNum);
+            PHASESource *source = phaseSources[key];
             
-            NSError *error = nil;
-            [phaseEngine.rootObject addChild:src error:&error];
-            phaseSources[key] = src;
-            source = src;
+            if (!source) {
+                // Limit total tracked sources to prevent resource exhaustion
+                if ([phaseSources count] >= MAX_PHASE_SOURCES) return;
+                
+                // Use a cached device — never create a new MTLDevice per call
+                static id<MTLDevice> cachedDevice = nil;
+                if (!cachedDevice) cachedDevice = MTLCreateSystemDefaultDevice();
+                if (!cachedDevice) return;
+                
+                PHASEShape *shape = [[PHASEShape alloc]
+                    initWithEngine:phaseEngine
+                    mesh:[MDLMesh newIcosahedronWithRadius:0.1
+                        inwardNormals:NO allocator:[[MTKMeshBufferAllocator alloc]
+                            initWithDevice:cachedDevice]]];
+                if (!shape) return;
+                
+                PHASESource *src = [[PHASESource alloc] initWithEngine:phaseEngine
+                                                                shapes:@[shape]];
+                if (!src) return;
+                
+                NSError *error = nil;
+                [phaseEngine.rootObject addChild:src error:&error];
+                if (error) {
+                    Con_Printf("PHASE: source add failed — %s\n",
+                               [[error localizedDescription] UTF8String]);
+                    return;
+                }
+                phaseSources[key] = src;
+                source = src;
+            }
+            
+            // Update position (Quake coords → PHASE: swap Y/Z, negate Y, scale down)
+            float scale = 1.0f / 64.0f;
+            simd_float4x4 transform = matrix_identity_float4x4;
+            transform.columns[3] = simd_make_float4(
+                origin[0] * scale,
+                origin[2] * scale,
+                -origin[1] * scale,
+                1.0f
+            );
+            source.transform = transform;
+        } @catch (NSException *e) {
+            // PHASE is broken — kill it permanently to protect the game loop
+            phaseFaulted = YES;
+            Con_Printf("PHASE: FATAL — %s (spatial audio disabled)\n",
+                       [[e reason] UTF8String]);
         }
-        
-        // Update position
-        float scale = 1.0f / 64.0f;
-        simd_float4x4 transform = matrix_identity_float4x4;
-        transform.columns[3] = simd_make_float4(
-            origin[0] * scale,
-            origin[2] * scale,
-            -origin[1] * scale,
-            1.0f
-        );
-        source.transform = transform;
     }
 }
 

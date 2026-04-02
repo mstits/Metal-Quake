@@ -181,6 +181,11 @@ void R_EmitEdge (mvertex_t *pv0, mvertex_t *pv1)
 
 	side = ceilv0 > r_ceilv1;
 
+	if (edge_p >= edge_max)
+	{
+		r_outofedges++;
+		return;
+	}
 	edge = edge_p++;
 
 	edge->owner = r_pedge;

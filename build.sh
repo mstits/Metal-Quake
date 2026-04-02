@@ -16,6 +16,8 @@ LDFLAGS="-framework Foundation -framework Metal -framework QuartzCore -framework
 LDFLAGS="$LDFLAGS -Wl,-weak_framework,MetalFX"
 LDFLAGS="$LDFLAGS -Wl,-weak_framework,PHASE"
 LDFLAGS="$LDFLAGS -framework CoreML -framework GameKit"
+# Apple-native frameworks for improvements
+LDFLAGS="$LDFLAGS -framework Accelerate -framework MetalPerformanceShaders -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework NaturalLanguage"
 
 # Common source files
 COMMON_SOURCES=(
@@ -117,8 +119,7 @@ SWIFT_SOURCES=(
 
 echo "Building Quake for Apple Silicon..."
 
-# Create build directory
-rm -rf build_obj
+# Create build directory (INCREMENTAL — do NOT rm -rf)
 mkdir -p build_obj
 
 # Compile Metal shaders to .metallib
@@ -141,46 +142,71 @@ if [ ${#METAL_AIR_FILES[@]} -gt 0 ]; then
 fi
 
 OBJ_FILES=()
+COMPILED=0
+SKIPPED=0
 
-# Compile C files
+# Compile C files (INCREMENTAL: only if source is newer than object)
 for f in "${COMMON_SOURCES[@]}"; do
     obj="build_obj/$(basename ${f%.c}.o)"
-    echo "Compiling $f..."
-    $CC $CFLAGS -c "$f" -o "$obj"
+    if [ "$f" -nt "$obj" ] || [ ! -f "$obj" ]; then
+        echo "Compiling $f..."
+        $CC $CFLAGS -c "$f" -o "$obj"
+        COMPILED=$((COMPILED + 1))
+    else
+        SKIPPED=$((SKIPPED + 1))
+    fi
     OBJ_FILES+=("$obj")
 done
 
-# Compile macOS Specific files
+# Compile macOS Specific files (INCREMENTAL)
 for f in "${MACOS_SOURCES[@]}"; do
     ext="${f##*.}"
     obj="build_obj/$(basename ${f%.$ext}.o)"
-    echo "Compiling $f..."
-    if [ "$ext" == "cpp" ] || [ "$ext" == "mm" ]; then
-        $CXX $CXXFLAGS -c "$f" -o "$obj"
+    if [ "$f" -nt "$obj" ] || [ ! -f "$obj" ]; then
+        echo "Compiling $f..."
+        if [ "$ext" == "cpp" ] || [ "$ext" == "mm" ]; then
+            $CXX $CXXFLAGS -c "$f" -o "$obj"
+        else
+            $CC $CFLAGS -c "$f" -o "$obj"
+        fi
+        COMPILED=$((COMPILED + 1))
     else
-        $CC $CFLAGS -c "$f" -o "$obj"
+        SKIPPED=$((SKIPPED + 1))
     fi
     OBJ_FILES+=("$obj")
 done
 
 # Compile Swift sources (SwiftUI launcher)
 if [ ${#SWIFT_SOURCES[@]} -gt 0 ]; then
-    echo "Compiling Swift sources..."
     SWIFT_OBJ="build_obj/MetalQuakeLauncher.o"
-    swiftc -parse-as-library -emit-object -O \
-        -import-objc-header src/macos/MetalQuakeBridge.h \
-        -target arm64-apple-macos26.0 \
-        -Xcc -I -Xcc ./Quake -Xcc -I -Xcc ./src/macos \
-        "${SWIFT_SOURCES[@]}" \
-        -o "$SWIFT_OBJ" 2>&1 || {
-        echo "Warning: Swift compilation failed — launcher will not be available"
-        SWIFT_OBJ=""
-    }
+    SWIFT_NEEDS_REBUILD=0
+    for sf in "${SWIFT_SOURCES[@]}"; do
+        if [ "$sf" -nt "$SWIFT_OBJ" ] || [ ! -f "$SWIFT_OBJ" ]; then
+            SWIFT_NEEDS_REBUILD=1
+            break
+        fi
+    done
+    if [ $SWIFT_NEEDS_REBUILD -eq 1 ]; then
+        echo "Compiling Swift sources..."
+        swiftc -parse-as-library -emit-object -O \
+            -import-objc-header src/macos/MetalQuakeBridge.h \
+            -target arm64-apple-macos26.0 \
+            -Xcc -I -Xcc ./Quake -Xcc -I -Xcc ./src/macos \
+            "${SWIFT_SOURCES[@]}" \
+            -o "$SWIFT_OBJ" 2>&1 || {
+            echo "Warning: Swift compilation failed — launcher will not be available"
+            SWIFT_OBJ=""
+        }
+        COMPILED=$((COMPILED + 1))
+    else
+        SKIPPED=$((SKIPPED + 1))
+    fi
     if [ -n "$SWIFT_OBJ" ]; then
         OBJ_FILES+=("$SWIFT_OBJ")
     fi
 fi
 
+echo "Compiled: $COMPILED files, Skipped: $SKIPPED (up to date)"
 echo "Linking..."
 $CXX "${OBJ_FILES[@]}" -o quake_metal $LDFLAGS -framework SwiftUI -L$(xcrun --toolchain default --show-sdk-platform-path)/../../lib/swift/macosx -lswiftCore 2>/dev/null || \
 $CXX "${OBJ_FILES[@]}" -o quake_metal $LDFLAGS 2>&1

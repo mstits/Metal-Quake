@@ -1,0 +1,36 @@
+{
+  "storage" : "model.espresso.weights",
+  "analyses" : {
+
+  },
+  "properties" : {
+
+  },
+  "format_version" : 200,
+  "metadata_in_weights" : [
+
+  ],
+  "layers" : [
+    {
+      "top" : "output",
+      "use_fractional_scale_factors" : false,
+      "weights" : {
+
+      },
+      "fractional_scaling_factor_y" : 1,
+      "type" : "upsample",
+      "scaling_factor_x" : 4,
+      "mode" : 1,
+      "attributes" : {
+        "is_output" : 1
+      },
+      "align_corners" : 0,
+      "bottom" : "input",
+      "debug_info" : "upsample4x",
+      "fractional_scaling_factor_x" : 1,
+      "is_legacy_mode" : 1,
+      "name" : "upsample4x",
+      "scaling_factor_y" : 4
+    }
+  ]
+}

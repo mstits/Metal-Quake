@@ -91,6 +91,13 @@ typedef struct {
     int             high_contrast_hud;  /**< High-contrast HUD mode (0/1) */
     int             subtitles;          /**< Event subtitles (0/1) */
 
+    /* ---- Post-Processing ---- */
+    int             crt_mode;           /**< CRT scanline filter (0/1) */
+    int             ssao_enabled;       /**< Screen-Space Ambient Occlusion (0/1) */
+    int             chromatic_aberration; /**< Chromatic aberration (0/1) */
+    int             edr_enabled;        /**< Extended Dynamic Range on XDR displays (0/1) */
+    int             underwater_fx;      /**< Enhanced underwater distortion (0/1) */
+
     /* ---- Internal ---- */
     int             _dirty;             /**< Settings changed flag (atomic) */
 } MetalQuakeSettings;

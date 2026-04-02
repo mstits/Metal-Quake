@@ -1,5 +1,6 @@
 #import <GameController/GameController.h>
 #import <CoreHaptics/CoreHaptics.h>
+#import <AppKit/AppKit.h>
 
 extern "C" {
     #define __QBOOLEAN_DEFINED__
@@ -326,5 +327,17 @@ extern "C" void IN_PlayExplosionHaptic(float distance) {
 // Legacy compatibility
 extern "C" void IN_PlayHapticFeedback(void) {
     PlayHapticTransient(1.0f, 1.0f, 0.1f);
+}
+
+// #17 Force Touch Trackpad Haptics — works when no controller is connected
+extern "C" void IN_PlayTrackpadHaptic(int pattern) {
+    if (hapticEngine) return; // Controller haptics take priority
+    
+    // NSHapticFeedbackManager: provides haptic feedback on MacBook Force Touch trackpads
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSHapticFeedbackManager defaultPerformer]
+            performFeedbackPattern:(NSHapticFeedbackPattern)pattern
+            performanceTime:NSHapticFeedbackPerformanceTimeNow];
+    });
 }
 

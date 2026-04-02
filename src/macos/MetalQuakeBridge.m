@@ -220,3 +220,46 @@ void MQBridge_SyncSettings(void) {
     else Cvar_SetValue((char*)"m_pitch", 0.022f);
 }
 
+// ---- MetalFX Spatial Upscaler ----
+
+#if __has_include(<MetalFX/MetalFX.h>)
+#import <MetalFX/MetalFX.h>
+static id<MTLFXSpatialScaler> _mfxSpatialScaler = nil;
+
+void* MQBridge_CreateSpatialUpscaler(void* device, int srcW, int srcH, int dstW, int dstH, unsigned long pixelFormat) {
+    if (@available(macOS 13.0, *)) {
+        id<MTLDevice> mtlDevice = (__bridge id<MTLDevice>)device;
+        MTLFXSpatialScalerDescriptor *desc = [[MTLFXSpatialScalerDescriptor alloc] init];
+        desc.inputWidth = srcW;
+        desc.inputHeight = srcH;
+        desc.outputWidth = dstW;
+        desc.outputHeight = dstH;
+        desc.colorTextureFormat = (MTLPixelFormat)pixelFormat;
+        desc.outputTextureFormat = (MTLPixelFormat)pixelFormat;
+        desc.colorProcessingMode = MTLFXSpatialScalerColorProcessingModeLinear;
+        
+        _mfxSpatialScaler = [desc newSpatialScalerWithDevice:mtlDevice];
+        if (_mfxSpatialScaler) {
+            Con_Printf("MetalFX: Spatial upscaler %dx%d -> %dx%d\n", srcW, srcH, dstW, dstH);
+            return (__bridge_retained void*)_mfxSpatialScaler;
+        }
+        Con_Printf("MetalFX: Spatial upscaler creation failed\n");
+    }
+    return NULL;
+}
+
+int MQBridge_SpatialUpscale(void* scaler, void* cmdBuf, void* srcTex, void* dstTex) {
+    if (@available(macOS 13.0, *)) {
+        id<MTLFXSpatialScaler> s = (__bridge id<MTLFXSpatialScaler>)scaler;
+        if (!s) return 0;
+        s.colorTexture = (__bridge id<MTLTexture>)srcTex;
+        s.outputTexture = (__bridge id<MTLTexture>)dstTex;
+        [s encodeToCommandBuffer:(__bridge id<MTLCommandBuffer>)cmdBuf];
+        return 1;
+    }
+    return 0;
+}
+#else
+void* MQBridge_CreateSpatialUpscaler(void* d, int sw, int sh, int dw, int dh, unsigned long pf) { return NULL; }
+int MQBridge_SpatialUpscale(void* s, void* c, void* src, void* dst) { return 0; }
+#endif
