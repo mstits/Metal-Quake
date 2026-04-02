@@ -32,12 +32,12 @@ Features are categorized honestly:
 | Layer | Apple Framework | Status | What It Does |
 |-------|----------------|--------|-------------|
 | **Rendering** | Metal | ✅ Shipped | Metal device, command queue, texture pipeline, software renderer compositing |
-| **Spatial Audio** | PHASE | ✅ Shipped | PHASEEngine initialized, listener updated per-frame with player position |
+| **Spatial Audio** | PHASE | ✅ Shipped | PHASEEngine with BSP occlusion geometry rebuilt per map, per-frame listener tracking |
 | **Legacy Audio** | Core Audio | ✅ Shipped | Lock-free ring buffer, async pull model, 44.1kHz output |
 | **Mouse Input** | CGEvent | ✅ Shipped | Raw delta input with cursor capture/confinement, freelook, 8kHz on M3+ |
 | **Keyboard** | Carbon / NSEvent | ✅ Shipped | Full key mapping via system dispatch |
-| **Controllers** | GameController.framework | ✅ Shipped | DualSense + Xbox with Adaptive Trigger resistance |
-| **Haptics** | Core Haptics | ✅ Shipped | Per-weapon fire profiles (8 weapons), proportional damage rumble |
+| **Controllers** | GameController.framework | ✅ Shipped | DualSense + Xbox — full button mapping, Adaptive Triggers, sticks + D-pad |
+| **Haptics** | Core Haptics | ✅ Shipped | Per-weapon fire profiles (8 weapons), damage rumble, explosion distance feedback |
 | **Threading** | GCD | ✅ Shipped | `dispatch_apply` BSP leaf marking with atomic CAS, 12 P-core scaling |
 | **Networking** | Network.framework | ✅ Shipped | UDP driver with SPSC ring buffer (29 nw_ API calls) |
 | **UI** | SwiftUI | ✅ Shipped | Native launcher, settings panel, map gallery |
@@ -159,6 +159,23 @@ Metal_Quake/
 └── id1/                          # Game data (user-provided)
 ```
 
+## Controller Mapping
+
+Full gamepad support for DualSense, Xbox, and MFi controllers:
+
+| Button | Action |
+|--------|--------|
+| Right Trigger | Fire |
+| Left Trigger / A | Jump |
+| Y / Right Bumper | Next weapon |
+| Left Bumper | Previous weapon |
+| B | Swim down |
+| X | Use / Interact |
+| Menu | Pause (Escape) |
+| Left Stick | Move |
+| Right Stick | Look |
+| D-pad | Move (alternate) |
+
 ---
 
 ## Core Haptics — Per-Weapon Feedback
@@ -176,7 +193,7 @@ Every weapon has a distinct haptic profile tuned for its feel:
 | Rocket Launcher | 1.0 | 0.3 | 180ms | Heavy kick |
 | Lightning Gun | 0.5 | 1.0 | 20ms | Sustained buzz |
 
-Damage feedback scales proportionally — a 10 HP scratch is a light rumble, a 100 HP rocket hit is a full controller slam.
+Damage feedback scales proportionally — a 10 HP scratch is a light rumble, a 100 HP rocket hit is a full controller slam. Nearby explosions produce distance-attenuated low-frequency feedback.
 
 ---
 
