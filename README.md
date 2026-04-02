@@ -4,9 +4,7 @@
 
 > *A technical proof of concept exploring the rebuilding of a classic rendering and input engine entirely on Apple-native frameworks.*
 
-
 https://github.com/user-attachments/assets/a1a26eeb-9a0e-45be-9e3e-616848d55ff9
-
 
 ---
 
@@ -21,7 +19,7 @@ This is an **active work-in-progress** that acts as a testbed for Apple platform
 - **Rendering**: Implements a hybrid architecture. When `vid_rtx 1` is active, BSP geometry and dynamic lights are path-traced in Metal. The original software renderer is maintained in parallel to establish precise Z-buffer depth, allowing software-rendered particles and sprites to correctly occlude against the ray-traced world before being composited onto the Metal view.
 - **Input Robustness**: Mouse look exclusively relies on raw `CGEvent` deltas and programmatic cursor warping, forcefully establishing window focus to survive system-level event hijacking (such as `Cmd+Tab` or macOS screenshot overlays).
 - **Post-Processing**: 12-stage GPU fragment shader pipeline with CRT scanlines, Liquid Glass HUD, SSAO, EDR/HDR, ACES tonemapping, depth of field, bloom, and underwater warp — all hot-toggleable from the in-game Video Options menu.
-- **In Motion**: Mesh Shaders and trained CoreML weights are scaffolded but remain inactive in the current build chain. 
+- **In Motion**: Mesh Shaders and trained CoreML weights are scaffolded but remain inactive in the current build chain.
 
 ---
 
@@ -134,17 +132,19 @@ graph TB
 
 ## Project Structure
 
-```
+```text
 Metal_Quake/
-├── Quake/                        # Original id Tech 1 (C11, core engine)
+├── Quake/                        # id Tech 1 engine core (67 .c + 55 .h)
 │   └── sys_macos.m               # macOS system layer + event loop
-├── src/macos/                    # Native Apple platform layer
-│   ├── vid_metal.cpp             # Metal rendering + texture compositing
-│   ├── rt_shader.metal           # RT intersection shader
-│   ├── MQ_MeshShaders.metal      # Object/mesh/fragment pipeline (scaffolded)
-│   ├── MQ_LiquidGlass.metal      # Refractive glass compositor (scaffolded)
+├── src/macos/                    # Apple platform layer (20 files)
+│   ├── vid_metal.cpp             # Metal rendering, PostFX pipeline, 12-item menu
+│   ├── rt_shader.metal           # RT intersection + GI compute kernel
+│   ├── Metal_Renderer_Main.cpp   # Settings init/save/load lifecycle
+│   ├── Metal_Settings.h          # MetalQuakeSettings struct definition
+│   ├── MQ_MeshShaders.metal      # Object/mesh/fragment pipeline (M3+)
+│   ├── MQ_LiquidGlass.metal      # Refractive glass compositor
 │   ├── MQ_PHASE_Audio.m          # PHASE spatial audio
-│   ├── MQ_CoreML.m               # Neural denoiser + upscaler (scaffolded)
+│   ├── MQ_CoreML.m               # CoreML denoiser + upscaler (ANE)
 │   ├── MQ_Ecosystem.m            # Game Center + SharePlay + Accessibility
 │   ├── MetalQuakeLauncher.swift  # SwiftUI launcher
 │   ├── net_apple.cpp             # Network.framework UDP driver
@@ -152,6 +152,10 @@ Metal_Quake/
 │   ├── in_gamecontroller.mm      # GameController + Haptics
 │   ├── GCD_Tasks.m               # Parallel dispatch utilities
 │   └── Sys_Tahoe_Input.mm        # Unified input architecture
+├── MQ_Denoiser.mlmodelc/         # CoreML denoiser model (ANE)
+├── MQ_RealESRGAN.mlmodelc/       # CoreML 4× upscaler model (ANE)
+├── scripts/                      # Build utilities
+│   └── create_coreml_models.py   # Placeholder model generator
 ├── metal-cpp/                    # Vendored Apple metal-cpp headers
 ├── build.sh                      # Single-command build (clang, arm64)
 └── id1/                          # Game data (user-provided)
