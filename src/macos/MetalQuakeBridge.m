@@ -4,6 +4,7 @@
  */
 
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
 
 // Quake includes
 #define __QBOOLEAN_DEFINED__
@@ -64,10 +65,52 @@ float MQBridge_GetFPS(void) {
 
 void MQBridge_SetLauncherVisible(int visible) {
     _launcherVisible = visible;
-    // When showing launcher, show cursor; when hiding, hide it
+    extern keydest_t key_dest;
+    
     if (visible) {
-        extern keydest_t key_dest;
+        // Showing launcher
         key_dest = key_menu;
+        CGDisplayShowCursor(kCGDirectMainDisplay);
+        CGAssociateMouseAndMouseCursorPosition(YES); // free mouse
+        
+        // Show SwiftUI overlay
+        if (@available(macOS 26.0, *)) {
+            extern NSWindow *gameWindow;
+            Class launcherClass = NSClassFromString(@"_TtC18MetalQuakeLauncher28MetalQuakeLauncherController");
+            if (launcherClass && gameWindow) {
+                id shared = [launcherClass valueForKey:@"shared"];
+                [shared performSelector:@selector(showIn:) withObject:gameWindow];
+            }
+        }
+    } else {
+        // Hiding launcher
+        
+        // Remove SwiftUI overlay first
+        if (@available(macOS 26.0, *)) {
+            Class launcherClass = NSClassFromString(@"_TtC18MetalQuakeLauncher28MetalQuakeLauncherController");
+            if (launcherClass) {
+                id shared = [launcherClass valueForKey:@"shared"];
+                [shared performSelector:@selector(hide)];
+            }
+        }
+        
+        // Restore game window as key
+        extern NSWindow *gameWindow;
+        if (gameWindow) {
+            [gameWindow makeKeyAndOrderFront:nil];
+            
+            // Warp cursor to window center to prevent edge-drift on resume
+            NSRect frame = [gameWindow frame];
+            CGFloat cx = NSMidX(frame);
+            CGFloat cy = NSMidY(frame);
+            CGFloat screenHeight = [[NSScreen mainScreen] frame].size.height;
+            CGWarpMouseCursorPosition(CGPointMake(cx, screenHeight - cy));
+        }
+        
+        // Recapture mouse for FPS
+        key_dest = key_game;
+        CGDisplayHideCursor(kCGDirectMainDisplay);
+        CGAssociateMouseAndMouseCursorPosition(NO);
     }
 }
 
@@ -123,3 +166,57 @@ const char* MQBridge_GetMapName(int index) {
     if (index < 0 || index >= (int)[_cachedMaps count]) return "";
     return [_cachedMaps[index] UTF8String];
 }
+
+// ---- Settings Sync: UserDefaults → MetalQuakeSettings → Engine ----
+
+void MQBridge_SyncSettings(void) {
+    MetalQuakeSettings *s = MQ_GetSettings();
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    
+    // Rendering
+    if ([d objectForKey:@"mq_rtEnabled"])      s->rt_enabled       = [d boolForKey:@"mq_rtEnabled"] ? 1 : 0;
+    if ([d objectForKey:@"mq_rtQuality"])       s->rt_quality       = (MQRTQuality)[d integerForKey:@"mq_rtQuality"];
+    if ([d objectForKey:@"mq_metalfxMode"])     s->metalfx_mode     = (MQMetalFXMode)[d integerForKey:@"mq_metalfxMode"];
+    if ([d objectForKey:@"mq_metalfxScale"])    s->metalfx_scale    = (float)[d doubleForKey:@"mq_metalfxScale"];
+    if ([d objectForKey:@"mq_neuralDenoise"])   s->neural_denoise   = [d boolForKey:@"mq_neuralDenoise"] ? 1 : 0;
+    if ([d objectForKey:@"mq_meshShaders"])     s->mesh_shaders     = [d boolForKey:@"mq_meshShaders"] ? 1 : 0;
+    if ([d objectForKey:@"mq_liquidGlassUI"])   s->liquid_glass_ui  = [d boolForKey:@"mq_liquidGlassUI"] ? 1 : 0;
+    
+    // Audio
+    if ([d objectForKey:@"mq_audioMode"])       s->audio_mode       = (MQAudioMode)[d integerForKey:@"mq_audioMode"];
+    if ([d objectForKey:@"mq_spatialAudio"])    s->spatial_audio    = [d boolForKey:@"mq_spatialAudio"] ? 1 : 0;
+    if ([d objectForKey:@"mq_masterVolume"])    s->master_volume    = (float)[d doubleForKey:@"mq_masterVolume"];
+    
+    // Input
+    if ([d objectForKey:@"mq_mouseSensitivity"]) s->mouse_sensitivity = (float)[d doubleForKey:@"mq_mouseSensitivity"];
+    if ([d objectForKey:@"mq_autoAim"])          s->auto_aim         = [d boolForKey:@"mq_autoAim"] ? 1 : 0;
+    if ([d objectForKey:@"mq_invertY"])           s->invert_y         = [d boolForKey:@"mq_invertY"] ? 1 : 0;
+    if ([d objectForKey:@"mq_rawMouse"])          s->raw_mouse        = [d boolForKey:@"mq_rawMouse"] ? 1 : 0;
+    if ([d objectForKey:@"mq_controllerDeadzone"]) s->controller_deadzone = (float)[d doubleForKey:@"mq_controllerDeadzone"];
+    
+    // Intelligence
+    if ([d objectForKey:@"mq_coremlTextures"])  s->coreml_textures  = [d boolForKey:@"mq_coremlTextures"] ? 1 : 0;
+    if ([d objectForKey:@"mq_neuralBots"])      s->neural_bots      = [d boolForKey:@"mq_neuralBots"] ? 1 : 0;
+    
+    // Accessibility
+    if ([d objectForKey:@"mq_soundSpatializer"]) s->sound_spatializer = [d boolForKey:@"mq_soundSpatializer"] ? 1 : 0;
+    if ([d objectForKey:@"mq_highContrastHUD"])  s->high_contrast_hud = [d boolForKey:@"mq_highContrastHUD"] ? 1 : 0;
+    if ([d objectForKey:@"mq_subtitles"])        s->subtitles        = [d boolForKey:@"mq_subtitles"] ? 1 : 0;
+    
+    s->_dirty = 1;
+    
+    // Apply to engine (syncs cvars like sensitivity, vid_rtx)
+    MQ_ApplySettings();
+    
+    // Sync additional cvars directly
+    extern void Cvar_SetValue(char *var_name, float value);
+    Cvar_SetValue((char*)"vid_rtx", s->rt_enabled ? 1.0f : 0.0f);
+    Cvar_SetValue((char*)"sensitivity", s->mouse_sensitivity);
+    // Only set volume if user explicitly configured it (don't zero out audio from unset defaults)
+    if ([d objectForKey:@"mq_masterVolume"] && s->master_volume > 0.001f) {
+        Cvar_SetValue((char*)"volume", s->master_volume);
+    }
+    if (s->invert_y) Cvar_SetValue((char*)"m_pitch", -0.022f);
+    else Cvar_SetValue((char*)"m_pitch", 0.022f);
+}
+

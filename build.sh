@@ -104,6 +104,12 @@ MACOS_SOURCES=(
     src/macos/MQ_Ecosystem.m
 )
 
+# Metal shader sources
+METAL_SOURCES=(
+    src/macos/rt_shader.metal
+    src/macos/MQ_MeshShaders.metal
+    src/macos/MQ_LiquidGlass.metal
+)
 # Swift sources (compiled separately with swiftc)
 SWIFT_SOURCES=(
     src/macos/MetalQuakeLauncher.swift
@@ -114,6 +120,25 @@ echo "Building Quake for Apple Silicon..."
 # Create build directory
 rm -rf build_obj
 mkdir -p build_obj
+
+# Compile Metal shaders to .metallib
+echo "Compiling Metal shaders..."
+METAL_AIR_FILES=()
+for f in "${METAL_SOURCES[@]}"; do
+    air="build_obj/$(basename ${f%.metal}.air)"
+    xcrun metal -c -target air64-apple-macos26.0 "$f" -o "$air" 2>&1 || {
+        echo "Warning: Metal shader $f failed to compile — skipping"
+        continue
+    }
+    METAL_AIR_FILES+=("$air")
+done
+
+if [ ${#METAL_AIR_FILES[@]} -gt 0 ]; then
+    xcrun metallib "${METAL_AIR_FILES[@]}" -o quake_rt.metallib 2>&1 || {
+        echo "Warning: metallib link failed — RT/Mesh shaders unavailable"
+    }
+    echo "Metal shaders compiled: quake_rt.metallib"
+fi
 
 OBJ_FILES=()
 

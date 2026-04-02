@@ -23,11 +23,16 @@ extern "C" {
 #include <vector>
 
 #include "vid_metal.hpp"
+#include "Metal_Settings.h"
 
 // GCD parallel dispatch (from GCD_Tasks.m)
 extern "C" void MQ_ParallelFor(size_t count, size_t stride,
                                 void* queue,
                                 void (^block)(size_t index));
+
+// CoreML neural pipeline (from MQ_CoreML.m)
+extern "C" int MQ_CoreML_Denoise(void* input, void* output, int width, int height);
+extern "C" int MQ_CoreML_UpscaleTexture(const unsigned char* inputPixels, unsigned char* outputPixels, int inW, int inH);
 
 // ---------------------------------------------------------------------------
 // Quake Globals
@@ -128,6 +133,8 @@ static struct model_s* _lastWorldModel = nullptr;
 static MTL::Texture* _pTextureAtlas = nullptr;
 static MTL::Buffer* _pTriTexInfoBuffer = nullptr;
 static MTL::Buffer* _pDynLightBuffer = nullptr;
+static MTL::ComputePipelineState* _pDenoiseState = nullptr; // GPU bilateral denoiser
+static MTL::Texture* _pDenoiseScratch = nullptr; // Ping-pong scratch for denoiser
 
 // Previous frame camera state for motion vector generation
 static float _prevCamOrigin[4] = {0};
@@ -831,39 +838,133 @@ static void BuildPipeline() {
             out.texCoord = texCoords[vertexID];
             return out;
         }
+        // --- Helper: ACES filmic tonemapping ---
+        float3 ACESFilm(float3 x) {
+            float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+            return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+        }
+        
+        // --- Helper: hash for film grain ---
+        float hash(float2 p) {
+            float3 p3 = fract(float3(p.xyx) * 0.1031);
+            p3 += dot(p3, p3.yzx + 33.33);
+            return fract((p3.x + p3.y) * p3.z);
+        }
+        
+        // --- Helper: get unified color (Software Palette or RT Overlay) ---
+        float3 getPixelColor(float2 uv, texture2d<uint> indexTex, texture2d<float> paletteTex, texture2d<float> rtTex) {
+            int iw = indexTex.get_width(), ih = indexTex.get_height();
+            int2 sc = int2(uv.x * (float)iw, uv.y * (float)ih);
+            sc = clamp(sc, int2(0), int2(iw - 1, ih - 1));
+            uint index = indexTex.read(uint2(sc)).r;
+            if (index == 254) {
+                // RTX overlay or chroma key
+                constexpr sampler lin(filter::linear);
+                return rtTex.sample(lin, uv).rgb;
+            } else {
+                return paletteTex.read(uint2(index, 0)).rgb;
+            }
+        }
+
         fragment float4 fragmentMain(VertexOut in [[stage_in]],
                                    texture2d<uint> indexTex [[texture(0)]],
                                    texture2d<float> paletteTex [[texture(1)]],
                                    texture2d<float> rtTex [[texture(2)]],
+                                   texture2d<float> depthTex [[texture(3)]],
                                    constant float4& screenBlend [[buffer(0)]]) {
             if (in.texCoord.x > 1.0 || in.texCoord.y > 1.0) discard_fragment();
-            uint2 swCoords = uint2(in.texCoord.x * (float)indexTex.get_width(), in.texCoord.y * (float)indexTex.get_height());
-            uint index = indexTex.read(swCoords).r;
-            float4 swColor = paletteTex.read(uint2(index, 0));
             
-            float4 color;
-            // Chroma-key: if RTX is enabled, software clears world to 255
-            if (index == 255) {
-                constexpr sampler linear_s(filter::linear);
-                color = rtTex.sample(linear_s, in.texCoord);
-            } else {
-                color = swColor;
+            // 1. Get base color
+            float3 color = getPixelColor(in.texCoord, indexTex, paletteTex, rtTex);
+            
+            // 2. High-Quality Bloom & Adaptive Sharpen
+            float3 bloomAccum = float3(0);
+            float bloomTotal = 0.0;
+            float2 texelSize = float2(1.0 / indexTex.get_width(), 1.0 / indexTex.get_height());
+            const int2 offsets[5] = { int2(0,0), int2(1,0), int2(-1,0), int2(0,1), int2(0,-1) };
+            const float weights[5] = { 0.382928, 0.241732, 0.241732, 0.241732, 0.241732 };
+            
+            float3 blurAccum = float3(0);
+            for(int i = 0; i < 5; i++) {
+                float2 uv = in.texCoord + float2(offsets[i]) * texelSize * 1.5;
+                float3 s = getPixelColor(uv, indexTex, paletteTex, rtTex);
+                blurAccum += s * weights[i];
+                float lum = dot(s, float3(0.2126, 0.7152, 0.0722));
+                float bright = max(lum - 0.75, 0.0); // Only bloom very bright areas
+                bloomAccum += s * bright * weights[i];
+                bloomTotal += weights[i];
             }
             
-            // Apply screen blend (damage flash, underwater tint, powerups)
+            color += (bloomAccum / bloomTotal) * 0.15; // Dialed back bloom
+            
+            // Unsharp Mask
+            float3 detail = color - (blurAccum / bloomTotal);
+            color = max(color + detail * 0.65, float3(0.0)); // Crispen edges and clamp to 0
+            
+            // 3. ACES filmic tonemapping
+            color = ACESFilm(color * 1.15); // Slight exposure boost before film curve
+            
+            // 4. Color Grading (Contrast & Saturation)
+            float lum = dot(color, float3(0.2126, 0.7152, 0.0722));
+            color = mix(float3(lum), color, 1.15); // Gentle saturation boost
+            color = mix(color, color * color * (3.0 - 2.0 * color), 0.2); // Subtle S-curve for contrast
+            
+            // 4.2. Cinematic Depth of Field (DoF)
+            int iw = indexTex.get_width(), ih = indexTex.get_height();
+            int2 sc = int2(in.texCoord.x * (float)iw, in.texCoord.y * (float)ih);
+            uint uiIndex = indexTex.read(uint2(clamp(sc, int2(0), int2(iw - 1, ih - 1)))).r;
+            if (uiIndex == 254) {
+                // Apply DoF to 3D world pixels only
+                constexpr sampler depthSamp(filter::linear);
+                float viewDepth = depthTex.sample(depthSamp, in.texCoord).r;
+                float focusDepth = depthTex.sample(depthSamp, float2(0.5, 0.5)).r; // Center point autofocus
+                
+                // Do not autofocus on sky (depth 00 or 1.0? Raytracer outputs depth. Sky is usually far).
+                // Actually, depth is linear distance from RT.
+                float depthDiff = abs(viewDepth - focusDepth);
+                float blurAmt = smoothstep(50.0, 400.0, depthDiff); // Tuning blur range units
+                if (blurAmt > 0.05) {
+                    float3 dofAccum = float3(0);
+                    float dofTotal = 0;
+                    // Optimized 4-tap Bokeh
+                    for(int i=0; i<4; i++) {
+                        float angle = i * 1.570796;
+                        float2 dofUV = in.texCoord + float2(cos(angle), sin(angle)) * texelSize * blurAmt * 4.0;
+                        dofAccum += getPixelColor(dofUV, indexTex, paletteTex, rtTex);
+                        dofTotal += 1.0;
+                    }
+                    color = mix(color, dofAccum / dofTotal, blurAmt * 0.75); // Blend Bokeh
+                }
+            }
+            
+            // 4.5. Volumetric God Rays removed - caused radial artifact banding around localized light fixtures
+            
+            
+            // 5. Cinematic Vignette
+            float2 vigUV = in.texCoord - 0.5;
+            float vig = 1.0 - dot(vigUV, vigUV) * 0.9;
+            vig = saturate(vig * vig);
+            color *= mix(0.65, 1.0, vig);
+            
+            // 7. Screen Blends (damage flashes, underwater, powerups)
             if (screenBlend.w > 0.001) {
-                color.rgb = mix(color.rgb, screenBlend.rgb, screenBlend.w);
+                color = mix(color, screenBlend.rgb, screenBlend.w);
             }
-            return color;
+            
+            return float4(saturate(color), 1.0);
         }
     )";
     NS::Error* pError = nullptr;
     auto* pLib = _pDevice->newLibrary(NS::String::string(shaderSource, UTF8StringEncoding), nullptr, &pError);
+    if (pError) {
+        printf("Metal Shader Compile Error: %s\n", pError->localizedDescription()->utf8String());
+        exit(1);
+    }
     auto* pVertexFn = pLib->newFunction(NS::String::string("vertexMain", UTF8StringEncoding));
     auto* pFragFn = pLib->newFunction(NS::String::string("fragmentMain", UTF8StringEncoding));
     auto* pDesc = MTL::RenderPipelineDescriptor::alloc()->init();
     pDesc->setVertexFunction(pVertexFn); pDesc->setFragmentFunction(pFragFn);
-    pDesc->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatBGRA8Unorm_sRGB);
+    pDesc->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
     _pPipelineState = _pDevice->newRenderPipelineState(pDesc, &pError);
     pVertexFn->release(); pFragFn->release();
 
@@ -991,62 +1092,135 @@ static void BuildPipeline() {
                 float w3 = sin(hitPos.y * 0.12 + time * 3.2) * cos(hitPos.x * 0.09 - time * 1.1) * 0.25;
                 float warp = (w1 + w2 + w3) * 0.3 + 0.5;
                 
-                // Specular highlight on liquid surface
-                float3 reflDir = reflect(r.direction, N + float3(w1, w2, 0) * 0.08);
-                float spec = pow(max(dot(reflDir, normalize(float3(0.4, 0.3, 0.85))), 0.0), 32.0) * 0.35;
+                // True Ray-Traced Reflection on liquid surface
+                float3 liqN = normalize(N + float3(w1, w2, 0) * 0.12);
+                float3 reflDir = reflect(r.direction, liqN);
                 
-                // Use the actual Quake texture as base, apply color tinting + animation
-                float3 texBase = baseColor; // original atlas-sampled texture
+                ray reflRay;
+                reflRay.origin = hitPos + liqN * 0.1;
+                reflRay.direction = reflDir;
+                reflRay.min_distance = 0.1;
+                reflRay.max_distance = 1000.0;
+                auto reflHit = isect.intersect(reflRay, scene);
+                
+                float3 reflColor = float3(0.05, 0.06, 0.08); // Sky/Dark fallback
+                if (reflHit.type == intersection_type::triangle) {
+                    uint rPrim = reflHit.primitive_id;
+                    TriTexInfo rtti = triTexInfos[rPrim];
+                    if (rtti.atlas_w >= 0.0 && rtti.tex_w >= 1.0) {
+                        float2 rBary = reflHit.triangle_barycentric_coord;
+                        float rBw = 1.0 - rBary.x - rBary.y;
+                        uint ri0 = indices[rPrim*3], ri1 = indices[rPrim*3+1], ri2 = indices[rPrim*3+2];
+                        float2 rUV = getUV(vertices, ri0)*rBw + getUV(vertices, ri1)*rBary.x + getUV(vertices, ri2)*rBary.y;
+                        float rtw = rtti.tex_w, rth = rtti.tex_h;
+                        float rsu = rUV.x - floor(rUV.x / rtw) * rtw;
+                        float rsv = rUV.y - floor(rUV.y / rth) * rth;
+                        rsu = clamp(rsu, 0.0f, rtw - 1.0f);
+                        rsv = clamp(rsv, 0.0f, rth - 1.0f);
+                        int raw = atlasTexture.get_width(), rah = atlasTexture.get_height();
+                        int rax = clamp((int)(rtti.atlas_u*(float)raw+rsu), 0, raw-1);
+                        int ray_v = clamp((int)(rtti.atlas_v*(float)rah+rsv), 0, rah-1);
+                        reflColor = atlasTexture.read(uint2(rax, ray_v)).rgb;
+                    } else {
+                        reflColor = float3(0.4);
+                    }
+                    float rBspLight = max(rtti.pad0, 0.2f);
+                    reflColor *= rBspLight * 1.5;
+                }
+                
+                // Use the actual Quake texture as base, apply color tinting + true reflection
+                float3 texBase = baseColor;
                 
                 if (liquidType < 1.5) {
-                    // Water — tint texture with teal, add caustics
+                    // Water — tint texture with teal, mix strongly with reflection
                     float3 tint = float3(0.4, 0.75, 0.8);
                     float caustic = (sin(hitPos.x * 0.15 + time * 2.0) * sin(hitPos.y * 0.15 + time * 1.7) + 1.0) * 0.08;
-                    baseColor = texBase * tint * (0.6 + warp * 0.4) + caustic + spec;
+                    baseColor = mix(texBase * tint * (0.6 + warp * 0.4) + caustic, reflColor, 0.6);
                 } else if (liquidType < 2.5) {
-                    // Lava — use texture with hot glow overlay
+                    // Lava — emissive, weak reflection
                     float pulse = sin(time * 2.5 + hitPos.x * 0.06 + hitPos.y * 0.04) * 0.25 + 0.75;
                     float3 hotTint = float3(1.2, 0.6, 0.2);
                     float hotSpot = pow(warp, 2.0) * pulse;
-                    baseColor = texBase * hotTint * (0.5 + hotSpot * 0.8) + float3(hotSpot * 0.3, hotSpot * 0.1, 0);
+                    baseColor = mix(texBase * hotTint * (0.5 + hotSpot * 0.8) + float3(hotSpot * 0.3, hotSpot * 0.1, 0), reflColor, 0.15);
                 } else if (liquidType < 3.5) {
-                    // Slime — use texture with green tint and bubbling
+                    // Slime — use texture with green tint and bubbling, medium reflection
                     float3 slimeTint = float3(0.5, 1.0, 0.4);
                     float bubble = pow(max(sin(hitPos.x * 0.2 + time * 3.0) * cos(hitPos.y * 0.25 + time * 2.2), 0.0), 4.0) * 0.2;
-                    baseColor = texBase * slimeTint * (0.5 + warp * 0.5) + float3(0.01, bubble, 0.01) + spec * 0.4;
+                    baseColor = mix(texBase * slimeTint * (0.5 + warp * 0.5) + float3(0.01, bubble, 0.01), reflColor, 0.3);
                 } else {
-                    // Teleporter — purple energy overlay
+                    // Teleporter — purple energy overlay, warped reflection
                     float pulse = sin(time * 4.0 + atan2(hitPos.y, hitPos.x) * 3.0) * 0.3 + 0.7;
-                    float spark = pow(hash(float2(hitPos.x * 0.3 + time * 5.0, hitPos.y * 0.3)), 8.0) * 0.5;
-                    baseColor = texBase * float3(0.6, 0.3, 0.9) * pulse + float3(spark * 0.2, spark * 0.05, spark * 0.5);
+                    baseColor = mix(texBase * float3(0.6, 0.3, 0.9) * pulse, reflColor, 0.45);
                 }
             }
             // === BSP lightmap + directional lighting ===
             float bspLight = tti.pad0; // BSP precomputed average light for this surface
+            if (tti.atlas_w < 0.0) {
+                bspLight = 0.4; // Base ambient fallback for dynamic entities (monsters, weapons)
+            }
             
-            float3 keyDir = normalize(float3(0.4, 0.3, 0.85));
+            float3 keyDirCenter = normalize(float3(0.4, 0.3, 0.85));
+            
+            // High-frequency jitter for temporal soft shadows
+            uint seed = tid.x + tid.y * 8192 + uint(time * 60.0) * 10000;
+            seed = (seed ^ 61) ^ (seed >> 16);
+            seed = seed + (seed << 3);
+            seed = seed ^ (seed >> 4);
+            seed = seed * 0x27d4eb2d;
+            float rx = fract(float(seed) / 4294967296.0) * 2.0 - 1.0;
+            float ry = fract(float(seed * 13) / 4294967296.0) * 2.0 - 1.0;
+            float3 jitter = float3(rx, ry, fract(float(seed * 17) / 4294967296.0) * 2.0 - 1.0) * 0.02;
+            
+            float3 keyDir = normalize(keyDirCenter + jitter);
             float keyDiffuse = max(dot(N, keyDir), 0.0);
 
             ray shadowRay;
-            shadowRay.origin = hitPos + N * 0.5;
+            shadowRay.origin = hitPos + N * 0.1;
             shadowRay.direction = keyDir;
             shadowRay.min_distance = 0.1;
             shadowRay.max_distance = 2000.0;
-            float shadowTerm = (isect.intersect(shadowRay, scene).type == intersection_type::triangle) ? 0.5 : 1.0;
+            float shadowTerm = (isect.intersect(shadowRay, scene).type == intersection_type::triangle) ? 0.1 : 1.0;
 
             // Blend BSP lightmap with directional fill for depth
-            float dirContrib = keyDiffuse * shadowTerm * 0.3;
-            float totalLight = max(bspLight * 2.8 + dirContrib, 0.18);
-            float3 warmTint = mix(float3(1.0, 0.95, 0.88), float3(1.0), 0.5);
+            float dirContrib = keyDiffuse * shadowTerm * 0.8;
+            float totalLight = max(bspLight * 2.5 + dirContrib, 0.25); // Higher ambient ambient clamp
+            float3 warmTint = mix(float3(1.0, 0.95, 0.85), float3(1.0), 0.5);
             float3 lighting = warmTint * totalLight;
+            
+            // True Emissive Surfaces (Base material glow)
+            float primaryLum = dot(baseColor, float3(0.333));
+            bool isEmissive = (baseColor.r > 0.7 && baseColor.g < 0.2 && baseColor.b < 0.2) || // Pure Red (Lava)
+                              (baseColor.b > 0.7 && baseColor.r < 0.3 && baseColor.g < 0.3) || // Pure Blue (Teleporter/Quad)
+                              (primaryLum > 0.85); // High intensity (Light fixtures)
+            if (isEmissive) {
+                lighting = baseColor * 2.0; // Glow cleanly without blowing out the accumulator
+            }
+            
+            // PBR Specularity based on texture luminance
+            float baseLum = dot(baseColor, float3(0.333));
+            float specExp = mix(8.0, 64.0, baseLum); // Brighter = sharper highlight
+            float3 viewDir = normalize(camOrigin.xyz - hitPos);
+            float3 halfVector = normalize(keyDir + viewDir);
+            float specTerm = pow(max(dot(N, halfVector), 0.0), specExp) * shadowTerm * baseLum * 0.4;
+            lighting += float3(specTerm);
 
-            // === One-bounce indirect GI ===
+            // === Stochastic Path Tracing GI ===
             {
-                float3 bounceDir = reflect(r.direction, N);
-                // Randomize slightly for diffuse-like bounce
-                bounceDir = normalize(bounceDir + N * 0.5);
+                // Cosine-weighted hemisphere sampling for Diffuse GI
+                float r1 = fract(float(seed * 23) / 4294967296.0);
+                float r2 = fract(float(seed * 29) / 4294967296.0);
+                float phi = r1 * 6.2831853;
+                float cosTheta = sqrt(r2);
+                float sinTheta = sqrt(1.0 - r2);
+                float3 H = float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+                
+                float3 tangent = normalize(cross(N, float3(0, 1, 0)));
+                if (length(tangent) < 0.1) tangent = normalize(cross(N, float3(1, 0, 0)));
+                float3 bitangent = cross(N, tangent);
+                float3 bounceDir = normalize(tangent * H.x + bitangent * H.y + N * H.z);
+                
                 ray bounceRay;
-                bounceRay.origin = hitPos + N * 0.5;
+                bounceRay.origin = hitPos + N * 0.1;
                 bounceRay.direction = bounceDir;
                 bounceRay.min_distance = 0.5;
                 bounceRay.max_distance = 800.0;
@@ -1076,7 +1250,7 @@ static void BuildPipeline() {
                         bColor = atlasTexture.read(uint2(bax, bay)).rgb;
                     }
                     float bBspLight = max(btti.pad0, 0.2f);
-                    lighting += bColor * bBspLight * 0.15; // BSP-lit indirect contribution
+                    lighting += bColor * bBspLight * 0.15; // Normal diffuse bounce
                 } else {
                     // Bounce hits sky — add subtle sky bounce
                     lighting += float3(0.04, 0.05, 0.07);
@@ -1218,9 +1392,12 @@ extern "C" void* Sys_GetNextDrawable(void* layer);
 
 extern "C" void VID_Init(unsigned char *palette) {
     static bool already_initialized = false; if (already_initialized) return; already_initialized = true;
-    int w = 320, h = 240;
+    // Window/display size — 1280x960 (4x internal 320x240)
+    // Rendered directly into drawable; GPU texture sampling handles upscale
+    int w = 1280, h = 960;
     int i; if ((i = COM_CheckParm("-width")) && i + 1 < com_argc) w = atoi(com_argv[i+1]);
     if ((i = COM_CheckParm("-height")) && i + 1 < com_argc) h = atoi(com_argv[i+1]);
+    // Internal software renderer always at 320x240 — MetalFX does the upscale
     vid.width  = 320; vid.height = 240; vid.rowbytes = vid.width;
     vid.buffer = (byte*)malloc(vid.width * vid.height);
     vid.aspect = ((float)vid.height / (float)vid.width) * (320.0f / 240.0f);
@@ -1253,22 +1430,102 @@ extern "C" void VID_Init(unsigned char *palette) {
     auto* pInterDesc = MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatBGRA8Unorm, vid.width, vid.height, false);
     pInterDesc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
     _pIntermediateTexture = _pDevice->newTexture(pInterDesc);
+    // MetalFX Spatial Scaler — upscales software renderer output (320x240 → window res)
     auto* pScalerDesc = MetalFX::SpatialScalerDescriptor::alloc()->init();
     pScalerDesc->setInputWidth(vid.width); pScalerDesc->setInputHeight(vid.height);
     pScalerDesc->setOutputWidth(w); pScalerDesc->setOutputHeight(h);
     pScalerDesc->setColorFormat(MTL::PixelFormatBGRA8Unorm); pScalerDesc->setOutputFormat(MTL::PixelFormatBGRA8Unorm);
     pScalerDesc->setColorProcessingMode(0);
     _pSpatialScaler = pScalerDesc->newSpatialScaler(_pDevice);
+    if (_pSpatialScaler) Con_Printf("MetalFX: Spatial scaler created (%dx%d → %dx%d)\n", vid.width, vid.height, w, h);
+    else Con_Printf("MetalFX: Spatial scaler FAILED — falling back to blit\n");
     // MetalFX Temporal Scaler — upgrades RT output using depth + motion vectors
     auto* pTempDesc = MetalFX::TemporalScalerDescriptor::alloc()->init();
     pTempDesc->setInputWidth(rtW); pTempDesc->setInputHeight(rtH);
-    pTempDesc->setOutputWidth(w * 2); pTempDesc->setOutputHeight(h * 2);
+    pTempDesc->setOutputWidth(w); pTempDesc->setOutputHeight(h);
     pTempDesc->setColorFormat(MTL::PixelFormatBGRA8Unorm);
     pTempDesc->setDepthFormat(MTL::PixelFormatR32Float);
     pTempDesc->setMotionFormat(MTL::PixelFormatRG16Float);
     pTempDesc->setOutputFormat(MTL::PixelFormatBGRA8Unorm);
     _pTemporalScaler = pTempDesc->newTemporalScaler(_pDevice);
-    if (_pTemporalScaler) Con_Printf("MetalFX: Temporal scaler created (%dx%d → %dx%d)\n", rtW, rtH, w*2, h*2);
+    if (_pTemporalScaler) Con_Printf("MetalFX: Temporal scaler created (%dx%d → %dx%d)\n", rtW, rtH, w, h);
+    else Con_Printf("MetalFX: Temporal scaler FAILED\n");
+    // --- GPU Bilateral Denoiser (inline Metal compute shader) ---
+    // À-trous wavelet filter: edge-aware spatial denoising for noisy RT output
+    {
+        const char* denoiseShader = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+// Edge-aware bilateral filter — preserves edges while smoothing noise
+// Uses cross-bilateral weights from depth + normal similarity
+kernel void bilateralDenoise(
+    texture2d<float, access::read>  input   [[texture(0)]],
+    texture2d<float, access::write> output  [[texture(1)]],
+    texture2d<float, access::read>  depthTx [[texture(2)]],
+    constant int&                   stepWidth [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= input.get_width() || gid.y >= input.get_height()) return;
+    
+    // 5-tap À-trous kernel offsets and weights
+    const int2 offsets[5] = { int2(0,0), int2(1,0), int2(-1,0), int2(0,1), int2(0,-1) };
+    const float weights[5] = { 0.375, 0.15625, 0.15625, 0.15625, 0.15625 };
+    
+    float4 centerColor = input.read(gid);
+    float  centerDepth = depthTx.read(gid).r;
+    
+    float4 sumColor = float4(0.0);
+    float  sumWeight = 0.0;
+    
+    float sigmaColor = 0.1;  // Color similarity threshold
+    float sigmaDepth = 0.05; // Depth similarity threshold
+    
+    for (int i = 0; i < 5; i++) {
+        int2 samplePos = int2(gid) + offsets[i] * stepWidth;
+        // Clamp to texture bounds
+        samplePos = clamp(samplePos, int2(0), int2(input.get_width()-1, input.get_height()-1));
+        
+        float4 sampleColor = input.read(uint2(samplePos));
+        float  sampleDepth = depthTx.read(uint2(samplePos)).r;
+        
+        // Edge-stop: color difference
+        float3 cdiff = centerColor.rgb - sampleColor.rgb;
+        float colorDist = dot(cdiff, cdiff);
+        float wColor = exp(-colorDist / (2.0 * sigmaColor * sigmaColor));
+        
+        // Edge-stop: depth difference
+        float depthDiff = abs(centerDepth - sampleDepth);
+        float wDepth = exp(-depthDiff / (2.0 * sigmaDepth * sigmaDepth));
+        
+        float w = weights[i] * wColor * wDepth;
+        sumColor += sampleColor * w;
+        sumWeight += w;
+    }
+    
+    output.write(sumColor / max(sumWeight, 0.0001), gid);
+}
+        )";
+        NS::Error* error = nullptr;
+        auto* src = NS::String::string(denoiseShader, NS::UTF8StringEncoding);
+        auto* lib = _pDevice->newLibrary(src, nullptr, &error);
+        if (lib) {
+            auto* fn = lib->newFunction(NS::String::string("bilateralDenoise", NS::UTF8StringEncoding));
+            if (fn) {
+                _pDenoiseState = _pDevice->newComputePipelineState(fn, &error);
+                if (_pDenoiseState) Con_Printf("Denoiser: GPU bilateral filter compiled\n");
+                fn->release();
+            }
+            lib->release();
+            // Scratch texture for ping-pong (same format/size as RT output)
+            auto* pScratchDesc = MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatBGRA8Unorm, rtW, rtH, false);
+            pScratchDesc->setUsage(MTL::TextureUsageShaderWrite | MTL::TextureUsageShaderRead);
+            pScratchDesc->setStorageMode(MTL::StorageModePrivate);
+            _pDenoiseScratch = _pDevice->newTexture(pScratchDesc);
+        } else {
+            Con_Printf("Denoiser: shader compilation failed\n");
+        }
+    }
     Cvar_RegisterVariable(&vid_rtx); vid_menudrawfn = VID_MenuDraw; vid_menukeyfn = VID_MenuKey;
 }
 
@@ -1325,11 +1582,41 @@ extern "C" void VID_Update(vrect_t *rects) {
         memcpy(_prevCamUp, fUp, 16);
         _temporalReset = false;
         _frameIndex++;
+        
+        // GPU bilateral denoiser — multi-pass À-trous wavelet filter
+        // 3 iterations at step widths 1, 2, 4 for multi-scale edge-aware denoising
+        if (_pDenoiseState && _pDenoiseScratch && MQ_GetSettings()->neural_denoise && _pRTOutputTexture) {
+            int stepWidths[] = {1, 2, 4};
+            MTL::Texture* readTex = _pRTOutputTexture;
+            MTL::Texture* writeTex = _pDenoiseScratch;
+            for (int pass = 0; pass < 3; pass++) {
+                auto* pDenEnc = pCmd->computeCommandEncoder();
+                pDenEnc->setComputePipelineState(_pDenoiseState);
+                pDenEnc->setTexture(readTex, 0);   // input
+                pDenEnc->setTexture(writeTex, 1);   // output
+                pDenEnc->setTexture(_pRTDepthTexture, 2); // depth for edge-stop
+                pDenEnc->setBytes(&stepWidths[pass], sizeof(int), 0);
+                pDenEnc->dispatchThreads(
+                    MTL::Size(readTex->width(), readTex->height(), 1),
+                    MTL::Size(_pDenoiseState->threadExecutionWidth(),
+                              _pDenoiseState->maxTotalThreadsPerThreadgroup() / _pDenoiseState->threadExecutionWidth(), 1));
+                pDenEnc->endEncoding();
+                // Ping-pong
+                MTL::Texture* tmp = readTex; readTex = writeTex; writeTex = tmp;
+            }
+            // If final result is in scratch, blit back to RT output
+            if (readTex == _pDenoiseScratch) {
+                auto* pBlit = pCmd->blitCommandEncoder();
+                pBlit->copyFromTexture(_pDenoiseScratch, _pRTOutputTexture);
+                pBlit->endEncoding();
+            }
+        }
     }
     auto* pRpd = MTL::RenderPassDescriptor::alloc()->init();
-    pRpd->colorAttachments()->object(0)->setTexture(_pIntermediateTexture); pRpd->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionDontCare); pRpd->colorAttachments()->object(0)->setStoreAction(MTL::StoreActionStore);
+    // Render directly into the drawable — GPU texture sampling upscales 320x240 → 640x480
+    pRpd->colorAttachments()->object(0)->setTexture(pDrawable->texture()); pRpd->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionDontCare); pRpd->colorAttachments()->object(0)->setStoreAction(MTL::StoreActionStore);
     auto* pEnc = pCmd->renderCommandEncoder(pRpd);
-    pEnc->setRenderPipelineState(_pPipelineState); pEnc->setFragmentTexture(pCurrentIdxTex, 0); pEnc->setFragmentTexture(_pPaletteTexture, 1); pEnc->setFragmentTexture(_pRTOutputTexture, 2);
+    pEnc->setRenderPipelineState(_pPipelineState); pEnc->setFragmentTexture(pCurrentIdxTex, 0); pEnc->setFragmentTexture(_pPaletteTexture, 1); pEnc->setFragmentTexture(_pRTOutputTexture, 2); pEnc->setFragmentTexture(_pRTDepthTexture, 3);
     // Compute screen blend from Quake's cshift system
     float screenBlend[4] = {0, 0, 0, 0};
     {
@@ -1353,8 +1640,6 @@ extern "C" void VID_Update(vrect_t *rects) {
     pEnc->setFragmentBytes(screenBlend, sizeof(screenBlend), 0);
     pEnc->drawPrimitives(MTL::PrimitiveTypeTriangle, (NS::UInteger)0, (NS::UInteger)3);
     pEnc->endEncoding(); pRpd->release();
-    if (_pSpatialScaler) { _pSpatialScaler->setColorTexture(_pIntermediateTexture); _pSpatialScaler->setOutputTexture(pDrawable->texture()); _pSpatialScaler->encodeToCommandBuffer(pCmd); }
-    else { auto* pBlit = pCmd->blitCommandEncoder(); pBlit->copyFromTexture(_pIntermediateTexture, pDrawable->texture()); pBlit->endEncoding(); }
     pCmd->presentDrawable(pDrawable); pCmd->addCompletedHandler([](MTL::CommandBuffer* pCmd) { dispatch_semaphore_signal(_frameSemaphore); });
     pCmd->commit(); pPool->release();
 }

@@ -89,6 +89,12 @@ int MQBridge_GetMapCount(void);
  */
 const char* MQBridge_GetMapName(int index);
 
+/**
+ * @brief Sync settings from UserDefaults (SwiftUI @AppStorage) to engine.
+ * Reads all mq_* keys, writes to MetalQuakeSettings, applies to cvars.
+ */
+void MQBridge_SyncSettings(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -14,32 +14,35 @@ import AppKit
 
 // MARK: - C Bridge
 
-/// Settings mirror for SwiftUI bindings
-struct MQSettingsSwift {
-    var rtEnabled: Bool = true
-    var rtQuality: Int = 2
-    var metalfxMode: Int = 1
-    var metalfxScale: Float = 2.0
-    var neuralDenoise: Bool = false
-    var meshShaders: Bool = false
-    var liquidGlassUI: Bool = true
+/// Persistent settings store — singleton so values survive panel close/reopen
+@available(macOS 26.0, *)
+class MQSettingsStore: ObservableObject {
+    static let shared = MQSettingsStore()
     
-    var audioMode: Int = 0
-    var spatialAudio: Bool = false
-    var masterVolume: Float = 0.7
+    @AppStorage("mq_rtEnabled") var rtEnabled: Bool = true
+    @AppStorage("mq_rtQuality") var rtQuality: Int = 2
+    @AppStorage("mq_metalfxMode") var metalfxMode: Int = 1
+    @AppStorage("mq_metalfxScale") var metalfxScale: Double = 2.0
+    @AppStorage("mq_neuralDenoise") var neuralDenoise: Bool = false
+    @AppStorage("mq_meshShaders") var meshShaders: Bool = false
+    @AppStorage("mq_liquidGlassUI") var liquidGlassUI: Bool = true
     
-    var mouseSensitivity: Float = 3.0
-    var autoAim: Bool = true
-    var invertY: Bool = false
-    var rawMouse: Bool = true
-    var controllerDeadzone: Float = 0.15
+    @AppStorage("mq_audioMode") var audioMode: Int = 0
+    @AppStorage("mq_spatialAudio") var spatialAudio: Bool = false
+    @AppStorage("mq_masterVolume") var masterVolume: Double = 0.7
     
-    var coremlTextures: Bool = false
-    var neuralBots: Bool = false
+    @AppStorage("mq_mouseSensitivity") var mouseSensitivity: Double = 3.0
+    @AppStorage("mq_autoAim") var autoAim: Bool = true
+    @AppStorage("mq_invertY") var invertY: Bool = false
+    @AppStorage("mq_rawMouse") var rawMouse: Bool = true
+    @AppStorage("mq_controllerDeadzone") var controllerDeadzone: Double = 0.15
     
-    var soundSpatializer: Bool = false
-    var highContrastHUD: Bool = false
-    var subtitles: Bool = false
+    @AppStorage("mq_coremlTextures") var coremlTextures: Bool = false
+    @AppStorage("mq_neuralBots") var neuralBots: Bool = false
+    
+    @AppStorage("mq_soundSpatializer") var soundSpatializer: Bool = false
+    @AppStorage("mq_highContrastHUD") var highContrastHUD: Bool = false
+    @AppStorage("mq_subtitles") var subtitles: Bool = false
 }
 
 // MARK: - Map Model
@@ -102,7 +105,7 @@ struct QuakeMap: Identifiable, Hashable {
 struct MetalQuakeLauncherView: View {
     @State private var selectedTab = 0
     @State private var selectedMap: QuakeMap? = nil
-    @State private var settings = MQSettingsSwift()
+    @ObservedObject private var settings = MQSettingsStore.shared
     @State private var showingMapDetail = false
     @State private var animateIn = false
     
@@ -161,6 +164,15 @@ struct MetalQuakeLauncherView: View {
                 StatusPill(label: "RT Active", icon: "rays", color: .orange)
                 StatusPill(label: "MetalFX 2×", icon: "arrow.up.right.and.arrow.down.left.rectangle.fill", color: .blue)
             }
+            // Resume button
+            Button(action: resumeGame) {
+                Label("Resume", systemImage: "play.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.green)
         }
         .padding(.horizontal, 24)
         .padding(.vertical, 16)
@@ -310,6 +322,29 @@ struct MetalQuakeLauncherView: View {
                 }
             }
             .padding(24)
+            
+            // Apply + Resume buttons
+            HStack(spacing: 16) {
+                Spacer()
+                Button(action: resumeGame) {
+                    Label("Cancel", systemImage: "xmark")
+                        .font(.system(size: 14, weight: .medium))
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.bordered)
+                
+                Button(action: applyAndResume) {
+                    Label("Apply & Resume", systemImage: "checkmark.circle.fill")
+                        .font(.system(size: 14, weight: .semibold))
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+            }
+            .padding(.horizontal, 24)
+            .padding(.bottom, 16)
         }
     }
     
@@ -382,6 +417,16 @@ struct MetalQuakeLauncherView: View {
     
     func launchMap(_ map: QuakeMap) {
         MQBridge_StartMap(map.id)
+    }
+    
+    func resumeGame() {
+        MQBridge_SetLauncherVisible(0)
+    }
+    
+    func applyAndResume() {
+        // Sync all settings from UserDefaults → MetalQuakeSettings → engine cvars
+        MQBridge_SyncSettings()
+        MQBridge_SetLauncherVisible(0)
     }
 }
 
@@ -554,17 +599,14 @@ struct SettingsPicker: View {
 
 struct SettingsSlider: View {
     let title: String
-    @Binding var value: Float
-    let range: ClosedRange<Float>
+    @Binding var value: Double
+    let range: ClosedRange<Double>
     
     var body: some View {
         HStack {
             Text(title).font(.system(size: 13, weight: .medium))
             Spacer()
-            Slider(value: Binding(
-                get: { Double(value) },
-                set: { value = Float($0) }
-            ), in: Double(range.lowerBound)...Double(range.upperBound))
+            Slider(value: $value, in: range)
             .frame(maxWidth: 200)
             Text(String(format: "%.1f", value))
                 .font(.system(size: 11, design: .monospaced))
@@ -610,45 +652,73 @@ struct VisualEffectView: NSViewRepresentable {
     }
 }
 
-// MARK: - Hosting Controller
+// MARK: - Hosting Controller (NSPanel child window approach)
 
 @available(macOS 26.0, *)
 @objc public class MetalQuakeLauncherController: NSObject {
     
-    private var hostingView: NSHostingView<MetalQuakeLauncherView>?
+    private var panel: NSPanel?
     
     @objc public static let shared = MetalQuakeLauncherController()
     
-    @objc public func createLauncherView() -> NSView {
-        let view = NSHostingView(rootView: MetalQuakeLauncherView())
-        view.translatesAutoresizingMaskIntoConstraints = false
-        self.hostingView = view
-        return view
-    }
-    
     @objc public func show(in window: NSWindow) {
-        guard let contentView = window.contentView else { return }
-        
-        if hostingView?.superview != nil {
-            hostingView?.removeFromSuperview()
+        // Remove existing panel if any
+        if let existing = panel {
+            window.removeChildWindow(existing)
+            existing.orderOut(nil)
+            panel = nil
         }
         
-        let view = createLauncherView()
-        contentView.addSubview(view)
+        // Use the game window's screen frame for positioning
+        let windowFrame = window.frame
+        // Inset slightly for a nice overlay effect
+        let inset: CGFloat = 40
+        let panelFrame = NSRect(
+            x: windowFrame.origin.x + inset,
+            y: windowFrame.origin.y + inset,
+            width: windowFrame.width - inset * 2,
+            height: windowFrame.height - inset * 2
+        )
         
-        NSLayoutConstraint.activate([
-            view.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
-            view.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            view.topAnchor.constraint(equalTo: contentView.topAnchor),
-            view.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-        ])
+        // Create a titled, closable, resizable panel
+        let overlay = NSPanel(
+            contentRect: panelFrame,
+            styleMask: [.titled, .closable, .resizable, .utilityWindow],
+            backing: .buffered,
+            defer: false
+        )
+        overlay.title = "Metal Quake Launcher"
+        overlay.isFloatingPanel = true
+        overlay.level = .floating
+        overlay.isOpaque = false
+        overlay.backgroundColor = NSColor(white: 0.1, alpha: 0.95)
+        overlay.hasShadow = true
+        overlay.acceptsMouseMovedEvents = true
+        overlay.isMovableByWindowBackground = true
+        
+        // Create SwiftUI hosting view
+        let hostingView = NSHostingView(rootView: MetalQuakeLauncherView())
+        hostingView.frame = overlay.contentView?.bounds ?? panelFrame
+        hostingView.autoresizingMask = [.width, .height]
+        overlay.contentView = hostingView
+        
+        // Show as child window above the game
+        window.addChildWindow(overlay, ordered: .above)
+        overlay.makeKeyAndOrderFront(nil)
+        
+        panel = overlay
     }
     
     @objc public func hide() {
-        hostingView?.removeFromSuperview()
+        if let overlay = panel, let parent = overlay.parent {
+            parent.removeChildWindow(overlay)
+            overlay.orderOut(nil)
+            parent.makeKeyAndOrderFront(nil)
+        }
+        panel = nil
     }
     
     @objc public var isVisible: Bool {
-        return hostingView?.superview != nil
+        return panel != nil
     }
 }

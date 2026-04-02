@@ -1059,17 +1059,21 @@ void R_RenderView (void)
 	if (vid_rtx.value) {
 		// Safety: skip RT during map transitions when BSP data may be freed
 		if (!cl.worldmodel || !cl.worldmodel->surfaces || cls.signon < SIGNONS) {
-			memset(vid.buffer, 255, vid.width * vid.height);
+			memset(vid.buffer, 254, vid.width * vid.height);
 			return;
 		}
 		R_SetupFrame ();
-		memset(vid.buffer, 255, vid.width * vid.height);
-		// Initialize z-buffer to zero (far) so particles/sprites pass depth test
-		extern short *d_pzbuffer;
-		extern unsigned int d_zwidth;
-		if (d_pzbuffer) {
-			memset(d_pzbuffer, 0, d_zwidth * vid.height * sizeof(short));
-		}
+		R_MarkLeaves (); 
+		
+		// Render the software world just to populate the Software Z-Buffer
+		// This flawlessly depth-clips particles/sprites against walls without porting depth!
+		extern void R_EdgeDrawing(void);
+		R_EdgeDrawing ();
+		
+		// Clear the color buffer to the Metal compositor transparent chroma key
+		// so that we erase the opaque software walls, leaving only the Z-buffer intact.
+		memset(vid.buffer, 254, vid.width * vid.height);
+		
 		R_DrawParticles ();
 		// Draw sprite entities (explosions, bubbles) into software buffer
 		// These show through the compositor as non-255 pixels over the RT world

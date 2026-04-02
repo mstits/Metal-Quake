@@ -2,22 +2,22 @@
 
 ### A port of Quake to native Apple technologies.
 
-> *A technical proof of concept demonstrating that every layer of a classic game engine — rendering, audio, input, networking, UI, and intelligence — can be rebuilt entirely on Apple-native frameworks, delivering a modern experience that feels like it was always meant to run on Apple Silicon.*
+> *A technical proof of concept exploring the rebuilding of a classic rendering and input engine entirely on Apple-native frameworks.*
 
 ---
 
 ## What This Is
 
-**Metal Quake** takes id Software's original 1996 Quake engine and rebuilds every subsystem using native Apple technologies. No SDL. No OpenGL. No third-party dependencies. Every API call goes through an Apple framework.
+**Metal Quake** maps id Software's original 1996 Quake engine onto native Apple technologies. No SDL. No OpenGL. No third-party dependencies.
 
-This is a **tech demo and proof of concept** — a work-in-progress that aims to stress-test the full Apple platform stack, from the Neural Engine to the GPU to the DualSense controller in your hands.
+This is an **active work-in-progress** that acts as a testbed for Apple platform APIs inside of an existing C codebase.
 
-### Why It Matters
+### Current State & Observations
 
-- **Proves Apple Silicon is a first-class gaming platform.** Metal rendering, raw CGEvent mouse input, Core Audio, and GameController.framework — all running natively.
-- **Demonstrates deep framework integration.** Over a dozen Apple frameworks working together in one binary.
-- **Shows what native performance looks like.** No abstraction layer overhead — direct Apple API calls throughout.
-- **Preserves the original game perfectly.** The 1996 C codebase is largely untouched. Every original behavior is preserved.
+- **Rendering**: Implements a hybrid architecture. When `vid_rtx 1` is active, BSP geometry and dynamic lights are path-traced in Metal. The original software renderer is maintained in parallel to establish precise Z-buffer depth, allowing software-rendered particles and sprites to correctly occlude against the ray-traced world before being composited onto the Metal view.
+- **Input Robustness**: Mouse look exclusively relies on raw `CGEvent` deltas and programmatic cursor warping, forcefully establishing window focus to survive system-level event hijacking (such as `Cmd+Tab` or macOS screenshot overlays).
+- **Stability Sacrifices**: Advanced ray-tracing post-processing features (volumetric god rays, depth of field, film grain) are currently disabled due to visual tracking artifacts and shader instability.
+- **In Motion**: Mesh Shaders and Neural Upscaling/Denoising pipelines are scaffolded but remain inactive in the current build chain. 
 
 ---
 
@@ -25,34 +25,28 @@ This is a **tech demo and proof of concept** — a work-in-progress that aims to
 
 Features are categorized honestly:
 
-- ✅ **Shipped** — Compiled, linked, and running in the game loop
-- 🟡 **Scaffolded** — Real API calls exist in source, compiles and links, but not yet wired into the active render/audio path
-- 📋 **Planned** — Stubs or design intent only
+- **Shipped** — Compiled, linked, and actively running in the game loop every frame
+- **In Motion** — Built but disabled for stability, or partially integrated
+- **Planned** — Design intent only, not compiled into binary
 
 | Layer | Apple Framework | Status | What It Does |
-|-------|----------------|--------|-------------|
-| **Rendering** | Metal | ✅ Shipped | Metal device, command queue, texture pipeline, software renderer compositing |
-| **Spatial Audio** | PHASE | ✅ Shipped | PHASEEngine with BSP occlusion geometry rebuilt per map, per-frame listener tracking |
-| **Legacy Audio** | Core Audio | ✅ Shipped | Lock-free ring buffer, async pull model, 44.1kHz output |
-| **Mouse Input** | CGEvent | ✅ Shipped | Raw delta input with cursor capture/confinement, freelook, 8kHz on M3+ |
-| **Keyboard** | Carbon / NSEvent | ✅ Shipped | Full key mapping via system dispatch |
-| **Controllers** | GameController.framework | ✅ Shipped | DualSense + Xbox — full button mapping, Adaptive Triggers, sticks + D-pad |
-| **Haptics** | Core Haptics | ✅ Shipped | Per-weapon fire profiles (8 weapons), damage rumble, explosion distance feedback |
-| **Threading** | GCD | ✅ Shipped | `dispatch_apply` BSP leaf marking with atomic CAS, 12 P-core scaling |
-| **Networking** | Network.framework | ✅ Shipped | UDP driver with SPSC ring buffer (29 nw_ API calls) |
-| **UI** | SwiftUI | ✅ Shipped | Native launcher, settings panel, map gallery |
-| **Accessibility** | Custom | ✅ Shipped | Sound spatializer with directional overlay (user-toggleable) |
-| **Ray Tracing** | Metal 4 | 🟡 Scaffolded | RT shader with intersection functions exists, not yet dispatched in render loop |
-| **Upscaling** | MetalFX | 🟡 Scaffolded | Configuration and setup code present, scaler not yet allocated |
-| **Geometry** | Metal Mesh Shaders | 🟡 Scaffolded | Object/mesh/fragment stages written, not yet dispatched |
-| **Compositing** | Metal Compute | 🟡 Scaffolded | Liquid Glass refractive HUD shader (176 lines), not yet composited |
-| **Neural Denoising** | CoreML / ANE | 🟡 Scaffolded | MLModel load + predict code, requires user-provided .mlmodel |
-| **Texture Upscaling** | CoreML / ANE | 🟡 Scaffolded | Real-ESRGAN pipeline, requires user-provided .mlmodel |
-| **Achievements** | GameKit | 🟡 Scaffolded | GKLocalPlayer auth + score/achievement submit, no gameplay triggers wired |
-| **Multiplayer** | SharePlay | 📋 Planned | C-side stubs only, no GroupActivities session management |
-
-**17 Apple frameworks actively used. Additional frameworks scaffolded for future integration.**
-
+| --- | --- | --- | --- |
+| **Rendering** | Metal | Shipped | Metal device, texture pipeline, unified compositor with software elements |
+| **Ray Tracing** | Metal RT | Shipped | BLAS from BSP geometry, RT intersection, dynamic GI + emissive surfaces |
+| **Upscaling** | MetalFX | Shipped | Display scaling from internal resolution |
+| **Legacy Audio** | Core Audio | Shipped | Lock-free ring buffer, async pull model |
+| **Spatial Audio** | PHASE | Shipped | Per-frame listener position update (dual-engine alongside Core Audio) |
+| **Mouse Input** | CGEvent | Shipped | Raw delta input, continuous cursor warping, robust focus survival |
+| **Keyboard** | Carbon / NSEvent | Shipped | Full key mapping |
+| **Controllers** | GameController | Shipped | DualSense + Xbox — sticks, triggers, D-pad |
+| **Threading** | GCD | Shipped | `dispatch_apply` BSP leaf marking with atomic CAS |
+| **Networking** | Network.framework | Shipped | UDP driver with NWConnection/NWListener |
+| **UI** | SwiftUI | Shipped | NSPanel launcher overlay, full settings bridge to engine cvars |
+| **Settings Sync** | UserDefaults | Shipped | Cross-syncs `@AppStorage` values to engine variables |
+| **Neural Denoiser** | CoreML / ANE | In Motion | Call sites wired but gracefully skipped without ML models |
+| **Texture Upscaling** | CoreML / ANE | In Motion | Call sites wired but gracefully skipped without ML models |
+| **Mesh Shaders** | Metal 3.1 | In Motion | Shaders written but linker/toolchain issues temporarily block integration |
+| **Post-Processing** | Metal Compute | In Motion | Liquid Glass, DoF, and Film Grain currently disabled for visual stability |
 
 ---
 
@@ -61,13 +55,13 @@ Features are categorized honestly:
 Benchmarked on M4 Max, 640×480 internal resolution, software renderer + Metal compositing, `-nosound`:
 
 | Demo | FPS | Description |
-|------|-----|-------------|
+| --- | --- | --- |
 | demo1 (e1m1) | **487** | The Slipgate Complex — tight corridors |
 | demo2 (e1m4) | **283** | The Grisly Grotto — large open caverns |
 | demo3 (loop) | **322** | Mixed indoor/outdoor geometry |
 
 > [!NOTE]
-> These benchmarks reflect the software renderer composited via Metal. RT, mesh shader, and MetalFX pipelines are scaffolded but not yet active in the render loop.
+> These benchmarks reflect the software renderer composited via Metal RT. Mesh shader and MetalFX pipelines are scaffolded but not yet active in the render pipeline evaluation.
 
 ---
 
@@ -88,22 +82,22 @@ graph TB
 
     subgraph "Metal Pipeline"
         Composite["Metal Texture Composite"]
-        RT["RT Shader (scaffolded)"]
+        RT["RT Shader (active)"]
         MeshShader["Mesh Shaders (scaffolded)"]
-        MetalFX["MetalFX (scaffolded)"]
+        MetalFX["MetalFX (active)"]
         Glass["Liquid Glass (scaffolded)"]
     end
 
     subgraph "Audio"
-        CoreAudio["Core Audio ✅"]
-        PHASE["PHASE (scaffolded)"]
-        Haptics["Core Haptics ✅"]
+        CoreAudio["Core Audio (active)"]
+        PHASE["PHASE (active)"]
+        Haptics["Core Haptics (active)"]
     end
 
     subgraph "Input"
-        Mouse["CGEvent Mouse ✅"]
-        Controller["GameController ✅"]
-        Keys["Carbon Keyboard ✅"]
+        Mouse["CGEvent Mouse (active)"]
+        Controller["GameController (active)"]
+        Keys["Carbon Keyboard (active)"]
     end
 
     Launcher --> GameLoop
@@ -142,17 +136,17 @@ Metal_Quake/
 │   └── sys_macos.m               # macOS system layer + event loop
 ├── src/macos/                    # Native Apple platform layer
 │   ├── vid_metal.cpp             # Metal rendering + texture compositing
-│   ├── rt_shader.metal           # RT intersection shader (scaffolded)
+│   ├── rt_shader.metal           # RT intersection shader
 │   ├── MQ_MeshShaders.metal      # Object/mesh/fragment pipeline (scaffolded)
 │   ├── MQ_LiquidGlass.metal      # Refractive glass compositor (scaffolded)
-│   ├── MQ_PHASE_Audio.m          # PHASE spatial audio (scaffolded)
+│   ├── MQ_PHASE_Audio.m          # PHASE spatial audio
 │   ├── MQ_CoreML.m               # Neural denoiser + upscaler (scaffolded)
 │   ├── MQ_Ecosystem.m            # Game Center + SharePlay + Accessibility
 │   ├── MetalQuakeLauncher.swift  # SwiftUI launcher
-│   ├── net_apple.cpp             # Network.framework UDP driver (scaffolded)
+│   ├── net_apple.cpp             # Network.framework UDP driver
 │   ├── snd_coreaudio.cpp         # Core Audio ring buffer
 │   ├── in_gamecontroller.mm      # GameController + Haptics
-│   ├── GCD_Tasks.m               # Parallel dispatch utilities (scaffolded)
+│   ├── GCD_Tasks.m               # Parallel dispatch utilities
 │   └── Sys_Tahoe_Input.mm        # Unified input architecture
 ├── metal-cpp/                    # Vendored Apple metal-cpp headers
 ├── build.sh                      # Single-command build (clang, arm64)
@@ -164,7 +158,7 @@ Metal_Quake/
 Full gamepad support for DualSense, Xbox, and MFi controllers:
 
 | Button | Action |
-|--------|--------|
+| --- | --- |
 | Right Trigger | Fire |
 | Left Trigger / A | Jump |
 | Y / Right Bumper | Next weapon |
@@ -183,7 +177,7 @@ Full gamepad support for DualSense, Xbox, and MFi controllers:
 Every weapon has a distinct haptic profile tuned for its feel:
 
 | Weapon | Intensity | Sharpness | Duration | Feel |
-|--------|-----------|-----------|----------|------|
+| --- | --- | --- | --- | --- |
 | Axe | 0.6 | 0.9 | 50ms | Sharp thud |
 | Shotgun | 0.7 | 0.6 | 80ms | Medium punch |
 | Super Shotgun | 1.0 | 0.5 | 120ms | Heavy double-tap |
@@ -193,7 +187,7 @@ Every weapon has a distinct haptic profile tuned for its feel:
 | Rocket Launcher | 1.0 | 0.3 | 180ms | Heavy kick |
 | Lightning Gun | 0.5 | 1.0 | 20ms | Sustained buzz |
 
-Damage feedback scales proportionally — a 10 HP scratch is a light rumble, a 100 HP rocket hit is a full controller slam. Nearby explosions produce distance-attenuated low-frequency feedback.
+Damage feedback scales proportionally. Nearby explosions produce distance-attenuated low-frequency feedback.
 
 ---
 

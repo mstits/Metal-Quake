@@ -26,6 +26,7 @@ typedef int qboolean;
 #define false 0
 #include "quakedef.h"
 #include "sound.h"
+#include "Metal_Settings.h"
 #undef true
 #undef false
 
@@ -99,9 +100,9 @@ void MQ_PHASE_Init(void) {
         error = nil;
         [phaseEngine.rootObject addChild:phaseListener error:&error];
         
-        // Source pool
-        phaseSources = [NSMutableDictionary dictionary];
-        phaseSoundEvents = [NSMutableDictionary dictionary];
+        // Source pool (alloc/init to retain — this file is compiled without ARC)
+        phaseSources = [[NSMutableDictionary alloc] init];
+        phaseSoundEvents = [[NSMutableDictionary alloc] init];
         
         // Start the engine
         BOOL started = [phaseEngine startAndReturnError:&error];
@@ -113,6 +114,13 @@ void MQ_PHASE_Init(void) {
             phaseEngine = nil;
         }
     }
+}
+
+int MQ_PHASE_IsEnabled(void) {
+    // Check if PHASE audio mode is selected in settings
+    extern MetalQuakeSettings* MQ_GetSettings(void);
+    MetalQuakeSettings *s = MQ_GetSettings();
+    return (s && s->audio_mode == MQ_AUDIO_PHASE && phaseEngine != nil) ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------

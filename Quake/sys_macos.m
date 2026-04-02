@@ -11,7 +11,7 @@
 @end
 
 static QuakeAppDelegate *appDelegate;
-static NSWindow *gameWindow = nil;
+NSWindow *gameWindow = nil;
 static MTKView *g_mtkView = nil;
 qboolean isDedicated = false;
 float mouse_x, mouse_y;
@@ -81,6 +81,18 @@ static int MapKey(uint16_t keyCode) {
         case kVK_DownArrow: return K_DOWNARROW;
         case kVK_LeftArrow: return K_LEFTARROW;
         case kVK_RightArrow: return K_RIGHTARROW;
+        case kVK_F1: return K_F1;
+        case kVK_F2: return K_F2;
+        case kVK_F3: return K_F3;
+        case kVK_F4: return K_F4;
+        case kVK_F5: return K_F5;
+        case kVK_F6: return K_F6;
+        case kVK_F7: return K_F7;
+        case kVK_F8: return K_F8;
+        case kVK_F9: return K_F9;
+        case kVK_F10: return K_F10;
+        case kVK_F11: return K_F11;
+        case kVK_F12: return K_F12;
         default: return 0;
     }
 }
@@ -100,7 +112,7 @@ void* Sys_CreateWindow(int width, int height, void* pDevice) {
   [window setTitle:@"Quake Modern (Metal)"];
   
   g_mtkView = [[MTKView alloc] initWithFrame:frame device:device];
-  g_mtkView.colorPixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+  g_mtkView.colorPixelFormat = MTLPixelFormatBGRA8Unorm; // Must match MetalFX scaler output format
   g_mtkView.drawableSize = CGSizeMake(width, height);
   g_mtkView.paused = YES;
   g_mtkView.enableSetNeedsDisplay = NO;
@@ -109,7 +121,13 @@ void* Sys_CreateWindow(int width, int height, void* pDevice) {
       ((CAMetalLayer*)g_mtkView.layer).displaySyncEnabled = NO;
   }
   
-  [window setContentView:g_mtkView];
+  // Use a container view so SwiftUI overlays can layer on top of Metal
+  NSView *container = [[NSView alloc] initWithFrame:frame];
+  container.wantsLayer = YES;
+  g_mtkView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  [container addSubview:g_mtkView];
+  [window setContentView:container];
+  [window setAcceptsMouseMovedEvents:YES];
   [window makeKeyAndOrderFront:nil];
   [window center];
   
@@ -299,6 +317,18 @@ int main(int argc, char **argv) {
     extern void MQ_TasksInit(void);
     MQ_TasksInit();
     
+    // Initialize PHASE spatial audio engine (dual-engine alongside Core Audio)
+    extern void MQ_PHASE_Init(void);
+    MQ_PHASE_Init();
+    
+    // Initialize CoreML neural pipeline (graceful skip if no models)
+    extern void MQ_CoreML_Init(id device);
+    MQ_CoreML_Init(MTLCreateSystemDefaultDevice());
+    
+    // Sync settings from UserDefaults (launcher persistence) on startup
+    extern void MQBridge_SyncSettings(void);
+    MQBridge_SyncSettings();
+    
     // Enable mouse look by default and hide cursor
     extern void Cbuf_AddText(char *text);
     Cbuf_AddText("+mlook\n");
@@ -329,34 +359,12 @@ int main(int argc, char **argv) {
             case NSEventTypeKeyDown: {
               int k = MapKey([event keyCode]);
               
-              // F1 toggles SwiftUI launcher overlay
-              if (k == K_F1) {
+              // Tab toggles SwiftUI launcher overlay
+              if (k == K_TAB) {
                 extern int MQBridge_IsLauncherVisible(void);
                 extern void MQBridge_SetLauncherVisible(int visible);
-                if (MQBridge_IsLauncherVisible()) {
-                  // Hide launcher
-                  MQBridge_SetLauncherVisible(0);
-                  if (@available(macOS 26.0, *)) {
-                    Class launcherClass = NSClassFromString(@"MetalQuakeLauncherController");
-                    if (launcherClass) {
-                      id shared = [launcherClass valueForKey:@"shared"];
-                      [shared performSelector:@selector(hide)];
-                    }
-                  }
-                  CGDisplayHideCursor(kCGDirectMainDisplay);
-                  key_dest = key_game;
-                } else {
-                  // Show launcher
-                  MQBridge_SetLauncherVisible(1);
-                  if (@available(macOS 26.0, *)) {
-                    Class launcherClass = NSClassFromString(@"MetalQuakeLauncherController");
-                    if (launcherClass && gameWindow) {
-                      id shared = [launcherClass valueForKey:@"shared"];
-                      [shared performSelector:@selector(show:) withObject:gameWindow];
-                    }
-                  }
-                  CGDisplayShowCursor(kCGDirectMainDisplay);
-                }
+                int newState = !MQBridge_IsLauncherVisible();
+                MQBridge_SetLauncherVisible(newState);
                 break;
               }
               
@@ -366,23 +374,17 @@ int main(int argc, char **argv) {
                 extern void MQBridge_SetLauncherVisible(int visible);
                 if (MQBridge_IsLauncherVisible()) {
                   MQBridge_SetLauncherVisible(0);
-                  if (@available(macOS 26.0, *)) {
-                    Class launcherClass = NSClassFromString(@"MetalQuakeLauncherController");
-                    if (launcherClass) {
-                      id shared = [launcherClass valueForKey:@"shared"];
-                      [shared performSelector:@selector(hide)];
-                    }
-                  }
-                  CGDisplayHideCursor(kCGDirectMainDisplay);
-                  key_dest = key_game;
-                  break; // Don't pass Escape to Quake
+                  break;
                 }
               }
               
-              // Don't pass keys to engine when launcher is open
+              // When launcher is visible, forward everything to AppKit
               {
                 extern int MQBridge_IsLauncherVisible(void);
-                if (MQBridge_IsLauncherVisible()) break;
+                if (MQBridge_IsLauncherVisible()) {
+                  [app sendEvent:event];
+                  break;
+                }
               }
               
               if (k) Key_Event(k, true);
@@ -390,7 +392,7 @@ int main(int argc, char **argv) {
             }
             case NSEventTypeKeyUp: {
               extern int MQBridge_IsLauncherVisible(void);
-              if (MQBridge_IsLauncherVisible()) break;
+              if (MQBridge_IsLauncherVisible()) { [app sendEvent:event]; break; }
               int k = MapKey([event keyCode]);
               if (k) Key_Event(k, false);
               break;
@@ -400,19 +402,39 @@ int main(int argc, char **argv) {
             case NSEventTypeRightMouseDown:
             case NSEventTypeRightMouseUp:
             case NSEventTypeOtherMouseDown:
-            case NSEventTypeOtherMouseUp: {
+            case NSEventTypeOtherMouseUp:
+            case NSEventTypeScrollWheel: {
               extern int MQBridge_IsLauncherVisible(void);
               if (MQBridge_IsLauncherVisible()) {
-                [app sendEvent:event]; // Let SwiftUI handle clicks
+                [app sendEvent:event];
                 break;
               }
+              if ([event type] == NSEventTypeScrollWheel) break; // no game scroll
               int k;
               switch ([event type]) {
-                case NSEventTypeLeftMouseDown: k = K_MOUSE1; Key_Event(k, true); break;
+                case NSEventTypeLeftMouseDown: 
+                  if (![gameWindow isKeyWindow]) {
+                    [NSApp activateIgnoringOtherApps:YES];
+                    [gameWindow makeKeyAndOrderFront:nil];
+                  }
+                  k = K_MOUSE1; Key_Event(k, true); 
+                  break;
                 case NSEventTypeLeftMouseUp: k = K_MOUSE1; Key_Event(k, false); break;
-                case NSEventTypeRightMouseDown: k = K_MOUSE2; Key_Event(k, true); break;
+                case NSEventTypeRightMouseDown: 
+                  if (![gameWindow isKeyWindow]) {
+                    [NSApp activateIgnoringOtherApps:YES];
+                    [gameWindow makeKeyAndOrderFront:nil];
+                  }
+                  k = K_MOUSE2; Key_Event(k, true); 
+                  break;
                 case NSEventTypeRightMouseUp: k = K_MOUSE2; Key_Event(k, false); break;
-                case NSEventTypeOtherMouseDown: k = K_MOUSE3; Key_Event(k, true); break;
+                case NSEventTypeOtherMouseDown: 
+                  if (![gameWindow isKeyWindow]) {
+                    [NSApp activateIgnoringOtherApps:YES];
+                    [gameWindow makeKeyAndOrderFront:nil];
+                  }
+                  k = K_MOUSE3; Key_Event(k, true); 
+                  break;
                 case NSEventTypeOtherMouseUp: k = K_MOUSE3; Key_Event(k, false); break;
                 default: break;
               }
@@ -422,8 +444,12 @@ int main(int argc, char **argv) {
             case NSEventTypeLeftMouseDragged:
             case NSEventTypeRightMouseDragged:
             case NSEventTypeOtherMouseDragged: {
+              extern int MQBridge_IsLauncherVisible(void);
+              if (MQBridge_IsLauncherVisible()) {
+                [app sendEvent:event];
+                break;
+              }
               // Use CGEvent deltas for smooth, raw mouse input
-              // Only apply mouse movement when in-game (not menus/console)
               extern keydest_t key_dest;
               if (gameWindow && [gameWindow isKeyWindow] && key_dest == key_game) {
                 CGEventRef cgEvent = [event CGEvent];
@@ -448,30 +474,30 @@ int main(int argc, char **argv) {
           
           BOOL shouldGrab = (key_dest == key_game)
                          && gameWindow
-                         && [gameWindow isKeyWindow];
+                         && [gameWindow isKeyWindow]
+                         && [NSApp isActive];
           
           if (key_dest != _lastKeyDest || shouldGrab != _mouseGrabbed) {
             if (shouldGrab && !_mouseGrabbed) {
-              // Capture mouse: hide cursor, lock to center, disassociate
+              // Capture mouse: hide cursor, do NOT disassociate (avoids Cmd+Shift+4 bug)
               CGDisplayHideCursor(kCGDirectMainDisplay);
-              CGAssociateMouseAndMouseCursorPosition(false);
-              
-              // Warp cursor to window center to prevent edge drift
-              NSRect frame = [gameWindow frame];
-              CGFloat cx = NSMidX(frame);
-              CGFloat cy = NSMidY(frame);
-              // Convert to CG coordinates (origin at top-left of screen)
-              CGFloat screenHeight = [[NSScreen mainScreen] frame].size.height;
-              CGWarpMouseCursorPosition(CGPointMake(cx, screenHeight - cy));
-              
               _mouseGrabbed = YES;
             } else if (!shouldGrab && _mouseGrabbed) {
-              // Release mouse: show cursor, re-associate
-              CGAssociateMouseAndMouseCursorPosition(true);
+              // Release mouse: show cursor
               CGDisplayShowCursor(kCGDirectMainDisplay);
               _mouseGrabbed = NO;
             }
             _lastKeyDest = key_dest;
+          }
+          
+          if (_mouseGrabbed && gameWindow) {
+              // Continuously warp cursor to window center to prevent edge drift
+              // This acts as a robust substitute for CGAssociateMouse(false)
+              NSRect frame = [gameWindow frame];
+              CGFloat cx = NSMidX(frame);
+              CGFloat cy = NSMidY(frame);
+              CGFloat screenHeight = [[NSScreen mainScreen] frame].size.height;
+              CGWarpMouseCursorPosition(CGPointMake(cx, screenHeight - cy));
           }
         }
 
@@ -479,7 +505,6 @@ int main(int argc, char **argv) {
       }
     }
 
-    CGAssociateMouseAndMouseCursorPosition(true);
     CGDisplayShowCursor(kCGDirectMainDisplay);
     Host_Shutdown();
   }

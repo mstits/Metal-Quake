@@ -19,6 +19,11 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 */
 // snd_dma.c -- main control for any streaming sound output device
 
+// PHASE spatial audio (dual-engine: PHASE for spatial, Core Audio for mixing)
+extern void MQ_PHASE_UpdateListener(float origin[3], float forward[3], float right[3], float up[3]);
+extern void MQ_PHASE_UpdateSource(int entityNum, float origin[3], float volume);
+extern int MQ_PHASE_IsEnabled(void);
+
 #include "quakedef.h"
 
 void S_Play(void);
@@ -476,6 +481,11 @@ void S_StartSound(int entnum, int entchannel, sfx_t *sfx, vec3_t origin, float f
 	target_chan->entchannel = entchannel;
 	SND_Spatialize(target_chan);
 
+	// PHASE dual-engine: update spatial source position
+	if (MQ_PHASE_IsEnabled()) {
+		MQ_PHASE_UpdateSource(entnum, origin, fvol);
+	}
+
 	if (!target_chan->leftvol && !target_chan->rightvol)
 		return;		// not audible at all
 
@@ -687,6 +697,11 @@ void S_Update(vec3_t origin, vec3_t forward, vec3_t right, vec3_t up)
 	VectorCopy(forward, listener_forward);
 	VectorCopy(right, listener_right);
 	VectorCopy(up, listener_up);
+
+	// PHASE dual-engine: update spatial listener position
+	if (MQ_PHASE_IsEnabled()) {
+		MQ_PHASE_UpdateListener(origin, forward, right, up);
+	}
 	
 // update general area ambient sound sources
 	S_UpdateAmbientSounds ();
