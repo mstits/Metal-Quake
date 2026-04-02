@@ -1,97 +1,164 @@
 #!/bin/bash
+
+# Comprehensive build script for modern Quake on Apple Silicon
 set -e
 
-mkdir -p build/Quake.app/Contents/MacOS
-mkdir -p build/Quake.app/Contents/Resources
+# Compile options
+# -Wno-everything is used here to suppress warnings from the 1996 codebase
+# in a real development environment, we would fix these or use specific flags.
+CXX="clang++"
+CC="clang"
+CFLAGS="-O3 -g -std=c11 -I. -I./Quake -I./src/macos -I./metal-cpp -Wno-everything"
+CXXFLAGS="-O3 -g -std=c++17 -fobjc-arc -I. -I./Quake -I./src/macos -I./metal-cpp -Wno-everything"
+LDFLAGS="-framework Foundation -framework Metal -framework QuartzCore -framework GameController -framework CoreHaptics -framework Network -framework AudioUnit -framework AudioToolbox -framework AppKit -framework MetalKit"
 
-# Create PkgInfo
-echo "APPL????" > build/Quake.app/Contents/PkgInfo
+# Weak-link frameworks not on all macOS versions
+LDFLAGS="$LDFLAGS -Wl,-weak_framework,MetalFX"
+LDFLAGS="$LDFLAGS -Wl,-weak_framework,PHASE"
+LDFLAGS="$LDFLAGS -framework CoreML -framework GameKit"
 
-# Compile
-echo "Compiling..."
-clang -o build/Quake.app/Contents/MacOS/Quake \
-    -O2 -g \
-    -D__APPLE__ -DQuake \
-    -IWinQuake \
-    -framework Cocoa -framework Metal -framework MetalKit -framework IOKit -framework AudioToolbox -framework AVFoundation \
-    WinQuake/cl_demo.c \
-    WinQuake/cl_input.c \
-    WinQuake/cl_main.c \
-    WinQuake/cl_parse.c \
-    WinQuake/cl_tent.c \
-    WinQuake/chase.c \
-    WinQuake/cmd.c \
-    WinQuake/qcommon.c \
-    WinQuake/console.c \
-    WinQuake/crc.c \
-    WinQuake/cvar.c \
-    WinQuake/draw.c \
-    WinQuake/d_edge.c \
-    WinQuake/d_fill.c \
-    WinQuake/d_init.c \
-    WinQuake/d_modech.c \
-    WinQuake/d_part.c \
-    WinQuake/d_polyse.c \
-    WinQuake/d_scan.c \
-    WinQuake/d_sky.c \
-    WinQuake/d_sprite.c \
-    WinQuake/d_surf.c \
-    WinQuake/d_vars.c \
-    WinQuake/d_zpoint.c \
-    WinQuake/host.c \
-    WinQuake/host_cmd.c \
-    WinQuake/keys.c \
-    WinQuake/menu.c \
-    WinQuake/mathlib.c \
-    WinQuake/model.c \
-    WinQuake/net_dgrm.c \
-    WinQuake/net_loop.c \
-    WinQuake/net_main.c \
-    WinQuake/net_vcr.c \
-    WinQuake/net_udp.c \
-    WinQuake/net_bsd.c \
-    WinQuake/nonintel.c \
-    WinQuake/pr_cmds.c \
-    WinQuake/pr_edict.c \
-    WinQuake/pr_exec.c \
-    WinQuake/r_aclip.c \
-    WinQuake/r_alias.c \
-    WinQuake/r_bsp.c \
-    WinQuake/r_light.c \
-    WinQuake/r_draw.c \
-    WinQuake/r_efrag.c \
-    WinQuake/r_edge.c \
-    WinQuake/r_misc.c \
-    WinQuake/r_main.c \
-    WinQuake/r_sky.c \
-    WinQuake/r_sprite.c \
-    WinQuake/r_surf.c \
-    WinQuake/r_part.c \
-    WinQuake/r_vars.c \
-    WinQuake/screen.c \
-    WinQuake/sbar.c \
-    WinQuake/sv_main.c \
-    WinQuake/sv_phys.c \
-    WinQuake/sv_move.c \
-    WinQuake/sv_user.c \
-    WinQuake/zone.c \
-    WinQuake/view.c \
-    WinQuake/wad.c \
-    WinQuake/world.c \
-    WinQuake/snd_dma.c \
-    WinQuake/snd_mix.c \
-    WinQuake/snd_mem.c \
-    WinQuake/cd_null.c \
-    WinQuake/sys_macos.m \
-    WinQuake/vid_metal.m \
-    WinQuake/snd_macos.m \
-    WinQuake/in_macos.m
+# Common source files
+COMMON_SOURCES=(
+    Quake/chase.c
+    Quake/cl_demo.c
+    Quake/cl_input.c
+    Quake/cl_main.c
+    Quake/cl_parse.c
+    Quake/cl_tent.c
+    Quake/cmd.c
+    Quake/qcommon.c
+    Quake/console.c
+    Quake/crc.c
+    Quake/cvar.c
+    Quake/draw.c
+    Quake/host.c
+    Quake/host_cmd.c
+    Quake/keys.c
+    Quake/mathlib.c
+    Quake/menu.c
+    Quake/model.c
+    Quake/net_dgrm.c
+    Quake/net_loop.c
+    Quake/net_main.c
+    Quake/net_vcr.c
+    Quake/nonintel.c
+    Quake/pr_cmds.c
+    Quake/pr_edict.c
+    Quake/pr_exec.c
+    Quake/r_aclip.c
+    Quake/r_alias.c
+    Quake/r_bsp.c
+    Quake/r_draw.c
+    Quake/r_edge.c
+    Quake/r_efrag.c
+    Quake/r_light.c
+    Quake/r_main.c
+    Quake/r_misc.c
+    Quake/r_part.c
+    Quake/r_sky.c
+    Quake/r_sprite.c
+    Quake/r_surf.c
+    Quake/r_vars.c
+    Quake/sbar.c
+    Quake/screen.c
+    Quake/snd_dma.c
+    Quake/snd_mem.c
+    Quake/snd_mix.c
+    Quake/sv_main.c
+    Quake/sv_move.c
+    Quake/sv_phys.c
+    Quake/sv_user.c
+    Quake/view.c
+    Quake/wad.c
+    Quake/world.c
+    Quake/zone.c
+    Quake/d_edge.c
+    Quake/d_fill.c
+    Quake/d_init.c
+    Quake/d_modech.c
+    Quake/d_part.c
+    Quake/d_polyse.c
+    Quake/d_scan.c
+    Quake/d_sky.c
+    Quake/d_sprite.c
+    Quake/d_surf.c
+    Quake/d_vars.c
+    Quake/d_zpoint.c
+)
 
-# Copy Info.plist
-cp Info.plist.in build/Quake.app/Contents/Info.plist
+# Apple-native implementations
+MACOS_SOURCES=(
+    Quake/sys_macos.m
+    Quake/net_macos.c
+    Quake/cd_null.c
+    src/macos/vid_metal.cpp
+    src/macos/Metal_Renderer_Main.cpp
+    src/macos/Sys_Tahoe_Input.mm
+    src/macos/snd_coreaudio.cpp
+    src/macos/in_gamecontroller.mm
+    src/macos/net_apple.cpp
+    src/macos/GCD_Tasks.m
+    src/macos/MetalQuakeBridge.m
+    src/macos/MQ_PHASE_Audio.m
+    src/macos/MQ_CoreML.m
+    src/macos/MQ_Ecosystem.m
+)
 
-# Ad-hoc code signing (Required for Apple Silicon/arm64)
-echo "Signing application..."
-codesign --force --deep --sign - build/Quake.app
+# Swift sources (compiled separately with swiftc)
+SWIFT_SOURCES=(
+    src/macos/MetalQuakeLauncher.swift
+)
 
-echo "Build complete: build/Quake.app"
+echo "Building Quake for Apple Silicon..."
+
+# Create build directory
+rm -rf build_obj
+mkdir -p build_obj
+
+OBJ_FILES=()
+
+# Compile C files
+for f in "${COMMON_SOURCES[@]}"; do
+    obj="build_obj/$(basename ${f%.c}.o)"
+    echo "Compiling $f..."
+    $CC $CFLAGS -c "$f" -o "$obj"
+    OBJ_FILES+=("$obj")
+done
+
+# Compile macOS Specific files
+for f in "${MACOS_SOURCES[@]}"; do
+    ext="${f##*.}"
+    obj="build_obj/$(basename ${f%.$ext}.o)"
+    echo "Compiling $f..."
+    if [ "$ext" == "cpp" ] || [ "$ext" == "mm" ]; then
+        $CXX $CXXFLAGS -c "$f" -o "$obj"
+    else
+        $CC $CFLAGS -c "$f" -o "$obj"
+    fi
+    OBJ_FILES+=("$obj")
+done
+
+# Compile Swift sources (SwiftUI launcher)
+if [ ${#SWIFT_SOURCES[@]} -gt 0 ]; then
+    echo "Compiling Swift sources..."
+    SWIFT_OBJ="build_obj/MetalQuakeLauncher.o"
+    swiftc -parse-as-library -emit-object -O \
+        -import-objc-header src/macos/MetalQuakeBridge.h \
+        -target arm64-apple-macos26.0 \
+        -Xcc -I -Xcc ./Quake -Xcc -I -Xcc ./src/macos \
+        "${SWIFT_SOURCES[@]}" \
+        -o "$SWIFT_OBJ" 2>&1 || {
+        echo "Warning: Swift compilation failed — launcher will not be available"
+        SWIFT_OBJ=""
+    }
+    if [ -n "$SWIFT_OBJ" ]; then
+        OBJ_FILES+=("$SWIFT_OBJ")
+    fi
+fi
+
+echo "Linking..."
+$CXX "${OBJ_FILES[@]}" -o quake_metal $LDFLAGS -framework SwiftUI -L$(xcrun --toolchain default --show-sdk-platform-path)/../../lib/swift/macosx -lswiftCore 2>/dev/null || \
+$CXX "${OBJ_FILES[@]}" -o quake_metal $LDFLAGS 2>&1
+
+echo "Build complete! Binary: ./quake_metal"
+echo "Note: Ensure id1/pak0.pak is available for testing."

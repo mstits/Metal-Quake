@@ -1,129 +1,124 @@
 cmake_minimum_required(VERSION 3.15)
-project(Quake VERSION 1.09 LANGUAGES C OBJC)
+project(Quake VERSION 1.09 LANGUAGES C CXX OBJC OBJCXX)
 
 set(CMAKE_C_STANDARD 99)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_OBJC_STANDARD 99)
 
-# Define source files
-set(SOURCES
-    WinQuake/cl_demo.c
-    WinQuake/cl_input.c
-    WinQuake/cl_main.c
-    WinQuake/cl_parse.c
-    WinQuake/cl_tent.c
-    WinQuake/chase.c
-    WinQuake/cmd.c
-    WinQuake/common.c
-    WinQuake/console.c
-    WinQuake/crc.c
-    WinQuake/cvar.c
-    WinQuake/draw.c
-    WinQuake/d_edge.c
-    WinQuake/d_fill.c
-    WinQuake/d_init.c
-    WinQuake/d_modech.c
-    WinQuake/d_part.c
-    WinQuake/d_polyse.c
-    WinQuake/d_scan.c
-    WinQuake/d_sky.c
-    WinQuake/d_sprite.c
-    WinQuake/d_surf.c
-    WinQuake/d_vars.c
-    WinQuake/d_zpoint.c
-    WinQuake/host.c
-    WinQuake/host_cmd.c
-    WinQuake/keys.c
-    WinQuake/menu.c
-    WinQuake/mathlib.c
-    WinQuake/model.c
-    WinQuake/net_dgrm.c
-    WinQuake/net_loop.c
-    WinQuake/net_main.c
-    WinQuake/net_vcr.c
-    WinQuake/net_udp.c
-    WinQuake/net_bsd.c
-    WinQuake/nonintel.c
-    WinQuake/pr_cmds.c
-    WinQuake/pr_edict.c
-    WinQuake/pr_exec.c
-    WinQuake/r_aclip.c
-    WinQuake/r_alias.c
-    WinQuake/r_bsp.c
-    WinQuake/r_light.c
-    WinQuake/r_draw.c
-    WinQuake/r_efrag.c
-    WinQuake/r_edge.c
-    WinQuake/r_misc.c
-    WinQuake/r_main.c
-    WinQuake/r_sky.c
-    WinQuake/r_sprite.c
-    WinQuake/r_surf.c
-    WinQuake/r_part.c
-    WinQuake/r_vars.c
-    WinQuake/screen.c
-    WinQuake/sbar.c
-    WinQuake/sv_main.c
-    WinQuake/sv_phys.c
-    WinQuake/sv_move.c
-    WinQuake/sv_user.c
-    WinQuake/zone.c
-    WinQuake/view.c
-    WinQuake/wad.c
-    WinQuake/world.c
-    WinQuake/cd_null.c
-    # Platform specific
-    WinQuake/sys_macos.m
-    WinQuake/vid_metal.m
-    WinQuake/snd_macos.m
-    WinQuake/in_macos.m
+# Suppress warnings from the 1996 codebase.
+# In a real development environment, fix these or use specific flags.
+add_compile_options(-Wno-everything)
+
+# Enable ARC for Objective-C/C++ files
+set(CMAKE_OBJC_FLAGS "${CMAKE_OBJC_FLAGS} -fobjc-arc")
+set(CMAKE_OBJCXX_FLAGS "${CMAKE_OBJCXX_FLAGS} -fobjc-arc")
+
+# Common Quake engine sources (C)
+set(COMMON_SOURCES
+    Quake/chase.c
+    Quake/cl_demo.c
+    Quake/cl_input.c
+    Quake/cl_main.c
+    Quake/cl_parse.c
+    Quake/cl_tent.c
+    Quake/cmd.c
+    Quake/qcommon.c
+    Quake/console.c
+    Quake/crc.c
+    Quake/cvar.c
+    Quake/draw.c
+    Quake/host.c
+    Quake/host_cmd.c
+    Quake/keys.c
+    Quake/mathlib.c
+    Quake/menu.c
+    Quake/model.c
+    Quake/net_dgrm.c
+    Quake/net_loop.c
+    Quake/net_main.c
+    Quake/net_vcr.c
+    Quake/nonintel.c
+    Quake/pr_cmds.c
+    Quake/pr_edict.c
+    Quake/pr_exec.c
+    Quake/r_aclip.c
+    Quake/r_alias.c
+    Quake/r_bsp.c
+    Quake/r_draw.c
+    Quake/r_edge.c
+    Quake/r_efrag.c
+    Quake/r_light.c
+    Quake/r_main.c
+    Quake/r_misc.c
+    Quake/r_part.c
+    Quake/r_sky.c
+    Quake/r_sprite.c
+    Quake/r_surf.c
+    Quake/r_vars.c
+    Quake/sbar.c
+    Quake/screen.c
+    Quake/snd_dma.c
+    Quake/snd_mem.c
+    Quake/snd_mix.c
+    Quake/sv_main.c
+    Quake/sv_move.c
+    Quake/sv_phys.c
+    Quake/sv_user.c
+    Quake/view.c
+    Quake/wad.c
+    Quake/world.c
+    Quake/zone.c
+    Quake/d_edge.c
+    Quake/d_fill.c
+    Quake/d_init.c
+    Quake/d_modech.c
+    Quake/d_part.c
+    Quake/d_polyse.c
+    Quake/d_scan.c
+    Quake/d_sky.c
+    Quake/d_sprite.c
+    Quake/d_surf.c
+    Quake/d_vars.c
+    Quake/d_zpoint.c
 )
 
-# Add macOS frameworks
-find_library(COCOA_FRAMEWORK Cocoa)
-find_library(METAL_FRAMEWORK Metal)
-find_library(METALKIT_FRAMEWORK MetalKit)
-find_library(IOKIT_FRAMEWORK IOKit)
-find_library(AUDIO_TOOLBOX_FRAMEWORK AudioToolbox)
-find_library(AVFOUNDATION_FRAMEWORK AVFoundation)
-
-add_executable(Quake MACOSX_BUNDLE ${SOURCES})
-
-target_link_libraries(Quake
-    PRIVATE
-    ${COCOA_FRAMEWORK}
-    ${METAL_FRAMEWORK}
-    ${METALKIT_FRAMEWORK}
-    ${IOKIT_FRAMEWORK}
-    ${AUDIO_TOOLBOX_FRAMEWORK}
-    ${AVFOUNDATION_FRAMEWORK}
+# macOS platform sources
+set(MACOS_SOURCES
+    Quake/sys_macos.m
+    Quake/net_macos.c
+    Quake/cd_null.c
+    src/macos/vid_metal.cpp
+    src/macos/snd_coreaudio.cpp
+    src/macos/in_gamecontroller.mm
+    src/macos/net_apple.cpp
 )
 
-target_include_directories(Quake PRIVATE WinQuake)
+add_executable(quake_metal ${COMMON_SOURCES} ${MACOS_SOURCES})
 
-set_target_properties(Quake PROPERTIES
-    MACOSX_BUNDLE_BUNDLE_NAME "Quake"
-    MACOSX_BUNDLE_GUI_IDENTIFIER "com.idsoftware.quake"
-    MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
+target_include_directories(quake_metal PRIVATE
+    Quake
+    src/macos
+    metal-cpp
 )
 
-# Placeholder Info.plist
-file(WRITE ${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in
-    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-    <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-    <plist version=\"1.0\">
-    <dict>
-        <key>CFBundleExecutable</key>
-        <string>\$(EXECUTABLE_NAME)</string>
-        <key>CFBundleIdentifier</key>
-        <string>com.idsoftware.quake</string>
-        <key>CFBundleName</key>
-        <string>Quake</string>
-        <key>CFBundlePackageType</key>
-        <string>APPL</string>
-        <key>CFBundleShortVersionString</key>
-        <string>1.0</string>
-        <key>LSMinimumSystemVersion</key>
-        <string>10.15</string>
-    </dict>
-    </plist>"
+# Required Apple frameworks
+target_link_libraries(quake_metal PRIVATE
+    "-framework Foundation"
+    "-framework Metal"
+    "-framework QuartzCore"
+    "-framework AppKit"
+    "-framework MetalKit"
+    "-framework AudioUnit"
+    "-framework AudioToolbox"
+    "-framework GameController"
+    "-framework CoreHaptics"
+    "-framework Network"
+)
+
+# MetalFX is only available on macOS 13.0+
+target_link_options(quake_metal PRIVATE "-Wl,-weak_framework,MetalFX")
+
+# Build settings
+set_target_properties(quake_metal PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
 )

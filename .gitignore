@@ -1,0 +1,36 @@
+# Build artifacts
+build/
+build_obj/
+build_cmake/
+*.o
+*.d
+quake_metal
+*.dSYM/
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
+._*
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xcuserstate
+
+# IDE
+.vscode/
+.idea/
+
+# Game data (proprietary — not included)
+id1/
+
+# Temporary test files
+test*.c
