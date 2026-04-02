@@ -4,6 +4,10 @@
 
 > *A technical proof of concept exploring the rebuilding of a classic rendering and input engine entirely on Apple-native frameworks.*
 
+
+https://github.com/user-attachments/assets/a1a26eeb-9a0e-45be-9e3e-616848d55ff9
+
+
 ---
 
 ## What This Is
