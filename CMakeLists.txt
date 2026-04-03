@@ -15,78 +15,78 @@ set(CMAKE_OBJCXX_FLAGS "${CMAKE_OBJCXX_FLAGS} -fobjc-arc")
 
 # Common Quake engine sources (C)
 set(COMMON_SOURCES
-    Quake/chase.c
-    Quake/cl_demo.c
-    Quake/cl_input.c
-    Quake/cl_main.c
-    Quake/cl_parse.c
-    Quake/cl_tent.c
-    Quake/cmd.c
-    Quake/qcommon.c
-    Quake/console.c
-    Quake/crc.c
-    Quake/cvar.c
-    Quake/draw.c
-    Quake/host.c
-    Quake/host_cmd.c
-    Quake/keys.c
-    Quake/mathlib.c
-    Quake/menu.c
-    Quake/model.c
-    Quake/net_dgrm.c
-    Quake/net_loop.c
-    Quake/net_main.c
-    Quake/net_vcr.c
-    Quake/nonintel.c
-    Quake/pr_cmds.c
-    Quake/pr_edict.c
-    Quake/pr_exec.c
-    Quake/r_aclip.c
-    Quake/r_alias.c
-    Quake/r_bsp.c
-    Quake/r_draw.c
-    Quake/r_edge.c
-    Quake/r_efrag.c
-    Quake/r_light.c
-    Quake/r_main.c
-    Quake/r_misc.c
-    Quake/r_part.c
-    Quake/r_sky.c
-    Quake/r_sprite.c
-    Quake/r_surf.c
-    Quake/r_vars.c
-    Quake/sbar.c
-    Quake/screen.c
-    Quake/snd_dma.c
-    Quake/snd_mem.c
-    Quake/snd_mix.c
-    Quake/sv_main.c
-    Quake/sv_move.c
-    Quake/sv_phys.c
-    Quake/sv_user.c
-    Quake/view.c
-    Quake/wad.c
-    Quake/world.c
-    Quake/zone.c
-    Quake/d_edge.c
-    Quake/d_fill.c
-    Quake/d_init.c
-    Quake/d_modech.c
-    Quake/d_part.c
-    Quake/d_polyse.c
-    Quake/d_scan.c
-    Quake/d_sky.c
-    Quake/d_sprite.c
-    Quake/d_surf.c
-    Quake/d_vars.c
-    Quake/d_zpoint.c
+    src/core/chase.c
+    src/core/cl_demo.c
+    src/core/cl_input.c
+    src/core/cl_main.c
+    src/core/cl_parse.c
+    src/core/cl_tent.c
+    src/core/cmd.c
+    src/core/qcommon.c
+    src/core/console.c
+    src/core/crc.c
+    src/core/cvar.c
+    src/core/draw.c
+    src/core/host.c
+    src/core/host_cmd.c
+    src/core/keys.c
+    src/core/mathlib.c
+    src/core/menu.c
+    src/core/model.c
+    src/core/net_dgrm.c
+    src/core/net_loop.c
+    src/core/net_main.c
+    src/core/net_vcr.c
+    src/core/nonintel.c
+    src/core/pr_cmds.c
+    src/core/pr_edict.c
+    src/core/pr_exec.c
+    src/core/r_aclip.c
+    src/core/r_alias.c
+    src/core/r_bsp.c
+    src/core/r_draw.c
+    src/core/r_edge.c
+    src/core/r_efrag.c
+    src/core/r_light.c
+    src/core/r_main.c
+    src/core/r_misc.c
+    src/core/r_part.c
+    src/core/r_sky.c
+    src/core/r_sprite.c
+    src/core/r_surf.c
+    src/core/r_vars.c
+    src/core/sbar.c
+    src/core/screen.c
+    src/core/snd_dma.c
+    src/core/snd_mem.c
+    src/core/snd_mix.c
+    src/core/sv_main.c
+    src/core/sv_move.c
+    src/core/sv_phys.c
+    src/core/sv_user.c
+    src/core/view.c
+    src/core/wad.c
+    src/core/world.c
+    src/core/zone.c
+    src/core/d_edge.c
+    src/core/d_fill.c
+    src/core/d_init.c
+    src/core/d_modech.c
+    src/core/d_part.c
+    src/core/d_polyse.c
+    src/core/d_scan.c
+    src/core/d_sky.c
+    src/core/d_sprite.c
+    src/core/d_surf.c
+    src/core/d_vars.c
+    src/core/d_zpoint.c
 )
 
 # macOS platform sources
 set(MACOS_SOURCES
-    Quake/sys_macos.m
-    Quake/net_macos.c
-    Quake/cd_null.c
+    src/macos/sys_macos.m
+    src/core/net_macos.c
+    src/core/cd_null.c
     src/macos/vid_metal.cpp
     src/macos/snd_coreaudio.cpp
     src/macos/in_gamecontroller.mm
@@ -96,7 +96,7 @@ set(MACOS_SOURCES
 add_executable(quake_metal ${COMMON_SOURCES} ${MACOS_SOURCES})
 
 target_include_directories(quake_metal PRIVATE
-    Quake
+    src/core
     src/macos
     metal-cpp
 )
