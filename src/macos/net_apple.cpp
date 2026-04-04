@@ -118,6 +118,7 @@ extern "C" int UDP_Connect(int socket, struct qsockaddr *addr) {
     
     nw_endpoint_t endpoint = nw_endpoint_create_host(ip_str, port_str);
     nw_parameters_t parameters = nw_parameters_create_secure_udp(NW_PARAMETERS_DISABLE_PROTOCOL, NW_PARAMETERS_DEFAULT_CONFIGURATION);
+    nw_parameters_set_multipath_service(parameters, nw_multipath_service_interactive);
     
     nw_connection_t connection = nw_connection_create(endpoint, parameters);
     activeConnections[socket] = connection;
@@ -226,6 +227,7 @@ extern "C" int UDP_Broadcast(int socket, byte *buf, int len) {
     // Create a broadcast endpoint and send
     nw_endpoint_t broadcast = nw_endpoint_create_host("255.255.255.255", "27500");
     nw_parameters_t params = nw_parameters_create_secure_udp(NW_PARAMETERS_DISABLE_PROTOCOL, NW_PARAMETERS_DEFAULT_CONFIGURATION);
+    nw_parameters_set_multipath_service(params, nw_multipath_service_interactive);
     nw_connection_t conn = nw_connection_create(broadcast, params);
     nw_connection_set_queue(conn, nwQueue);
     nw_connection_start(conn);

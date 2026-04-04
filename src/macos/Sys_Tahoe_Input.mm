@@ -88,7 +88,35 @@ static MQInputState g_inputState = {};
  * @note On M3+ MacBook Pro, the trackpad supports 8kHz polling.
  *       CGEvent deltas automatically benefit from higher polling rates.
  */
+static CFMachPortRef g_mouseEventTap = NULL;
+
+static CGEventRef MQ_MouseCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon) {
+    if (type == kCGEventMouseMoved) {
+        if (!g_inputState.window_focused || g_inputState.key_dest != 0) return event;
+        
+        double dx = CGEventGetDoubleValueField(event, kCGMouseEventDeltaX);
+        double dy = CGEventGetDoubleValueField(event, kCGMouseEventDeltaY);
+        
+        g_inputState.mouse_dx += dx;
+        g_inputState.mouse_dy += dy;
+    }
+    return event;
+}
+
 void MQ_ProcessMouseEvent(NSEvent* event) {
+    if (!g_mouseEventTap) {
+        CGEventMask mask = CGEventMaskBit(kCGEventMouseMoved);
+        g_mouseEventTap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionListenOnly, mask, MQ_MouseCallback, NULL);
+        if (g_mouseEventTap) {
+            CFRunLoopSourceRef runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, g_mouseEventTap, 0);
+            CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, kCFRunLoopCommonModes);
+            CGEventTapEnable(g_mouseEventTap, true);
+            CFRelease(runLoopSource);
+        }
+    } else {
+        return; // Handled by CGEventTap zero-latency callback
+    }
+
     if (!g_inputState.window_focused) return;
     if (g_inputState.key_dest != 0) return; /* key_game = 0 */
 
@@ -173,6 +201,16 @@ void MQ_UpdateCursorState(void) {
 // Controller Input
 // ===========================================================================
 
+static struct {
+    bool a, b, x, y;
+    bool up, down, left, right;
+    bool l1, l2, l3;
+    bool r1, r2, r3;
+    bool menu, options;
+} prevControllerState = {0};
+
+extern "C" void Key_Event(int key, qboolean down);
+
 /**
  * @brief Poll the connected game controller and apply input.
  *
@@ -212,17 +250,87 @@ void MQ_PollController(void) {
     g_inputState.left_trigger = gp.leftTrigger.value;
     g_inputState.right_trigger = gp.rightTrigger.value;
 
-    /**
-     * @todo Phase 2: Apply controller look to viewangles.
-     * @todo Phase 2: Map buttons to Quake key events.
-     * @todo Phase 2: Set adaptive trigger resistance per-weapon.
-     */
+    /* Button Mapping */
+    auto checkBtn = [](bool& prev, bool curr, int key) {
+        if (curr != prev) {
+            Key_Event(key, curr);
+            prev = curr;
+        }
+    };
+
+    checkBtn(prevControllerState.a, gp.buttonA.isPressed, K_JOY1);
+    checkBtn(prevControllerState.b, gp.buttonB.isPressed, K_JOY2);
+    checkBtn(prevControllerState.x, gp.buttonX.isPressed, K_JOY3);
+    checkBtn(prevControllerState.y, gp.buttonY.isPressed, K_JOY4);
+    
+    checkBtn(prevControllerState.l1, gp.leftShoulder.isPressed, K_AUX1);
+    checkBtn(prevControllerState.r1, gp.rightShoulder.isPressed, K_AUX2);
+    checkBtn(prevControllerState.l2, gp.leftTrigger.isPressed, K_AUX3);
+    checkBtn(prevControllerState.r2, gp.rightTrigger.isPressed, K_AUX4);
+    
+    checkBtn(prevControllerState.up, gp.dpad.up.isPressed, K_UPARROW);
+    checkBtn(prevControllerState.down, gp.dpad.down.isPressed, K_DOWNARROW);
+    checkBtn(prevControllerState.left, gp.dpad.left.isPressed, K_LEFTARROW);
+    checkBtn(prevControllerState.right, gp.dpad.right.isPressed, K_RIGHTARROW);
+
+    if (@available(macOS 11.0, *)) {
+        if (gp.buttonOptions) checkBtn(prevControllerState.options, gp.buttonOptions.isPressed, K_ESCAPE);
+        if (gp.buttonMenu) checkBtn(prevControllerState.menu, gp.buttonMenu.isPressed, K_ESCAPE);
+        if (gp.leftThumbstickButton) checkBtn(prevControllerState.l3, gp.leftThumbstickButton.isPressed, K_AUX5);
+        if (gp.rightThumbstickButton) checkBtn(prevControllerState.r3, gp.rightThumbstickButton.isPressed, K_AUX6);
+    }
+    
+    // Adaptive Triggers for DualSense (macOS 11.3+)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+    if ([controller.physicalInputProfile isKindOfClass:NSClassFromString(@"GCDualSenseGamepad")]) {
+        id dualSense = controller.physicalInputProfile;
+        id rightTrigger = [dualSense valueForKey:@"rightTrigger"];
+        
+        // IT_SHOTGUN = 1, IT_SUPER_SHOTGUN = 2, IT_NAILGUN = 3, IT_SUPER_NAILGUN = 4, IT_GRENADE_LAUNCHER = 5, IT_ROCKET_LAUNCHER = 6, IT_LIGHTNING = 7
+        // Hardcoding rough resistance based on active weapon: cl.stats[STAT_ACTIVEWEAPON]
+        int weapon = cl.stats[STAT_ACTIVEWEAPON];
+        
+        // Map Quake weapon bitflags to numbers for easier logic
+        int wId = 0;
+        if (weapon == (1<<0)) wId = 0; // Axe
+        else if (weapon == (1<<1)) wId = 1; // Shotgun
+        else if (weapon == (1<<2)) wId = 2; // Super Shotgun
+        else if (weapon == (1<<3)) wId = 3; // Nailgun
+        else if (weapon == (1<<4)) wId = 4; // Super Nailgun
+        else if (weapon == (1<<5)) wId = 5; // Grenade Launcher
+        else if (weapon == (1<<6)) wId = 6; // Rocket Launcher
+        else if (weapon == (1<<7)) wId = 7; // Thunderbolt
+        
+        if (wId == 1 || wId == 2) {
+            // Shotgun / Super Shotgun: heavy pull, sudden break
+            [rightTrigger setModeWeaponWithStartPosition:0.2 endPosition:0.8 resistiveStrength:0.8];
+        } else if (wId == 3 || wId == 4) {
+            // Nailgun / Super Nailgun: continuous machine gun rattle
+            [rightTrigger setModeVibrationWithStartPosition:0.1 amplitude:0.5 frequency:10.0];
+        } else if (wId == 5 || wId == 6) {
+            // Grenade / Rocket Launcher: very heavy pull
+            [rightTrigger setModeFeedbackWithStartPosition:0.1 resistiveStrength:1.0];
+        } else if (wId == 7) {
+            // Lightning Gun: smooth resistance
+            [rightTrigger setModeFeedbackWithStartPosition:0.0 resistiveStrength:0.3];
+        } else {
+            // Axe / Default
+            [rightTrigger setModeFeedbackWithStartPosition:0.0 resistiveStrength:0.0];
+        }
+    }
+#pragma clang diagnostic pop
 }
 
 
 // ===========================================================================
 // Haptic Feedback
 // ===========================================================================
+
+#import <CoreHaptics/CoreHaptics.h>
+
+static CHHapticEngine* g_hapticEngine = nil;
+static bool g_hapticEngineStarted = false;
 
 /**
  * @brief Fire a haptic feedback pattern.
@@ -234,38 +342,38 @@ void MQ_PollController(void) {
  * @param intensity Effect intensity (0.0–1.0)
  * @param sharpness Effect sharpness (0.0=rumble, 1.0=click)
  * @param duration Effect duration in seconds
- *
- * @note Requires CHHapticEngine to be initialized (done in Phase 2).
  */
 void MQ_PlayHaptic(float intensity, float sharpness, float duration) {
-    (void)intensity; (void)sharpness; (void)duration;
-
-    /**
-     * @todo Phase 2: Create CHHapticEngine on first call.
-     * @code
-     * NSError* error = nil;
-     * CHHapticEngine* engine = [[CHHapticEngine alloc] initAndReturnError:&error];
-     * [engine startAndReturnError:&error];
-     *
-     * CHHapticEventParameter* intensityParam =
-     *     [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticIntensity
-     *                                                  value:intensity];
-     * CHHapticEventParameter* sharpnessParam =
-     *     [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticSharpness
-     *                                                  value:sharpness];
-     * CHHapticEvent* event =
-     *     [[CHHapticEvent alloc] initWithEventType:CHHapticEventTypeHapticTransient
-     *                                  parameters:@[intensityParam, sharpnessParam]
-     *                                relativeTime:0
-     *                                    duration:duration];
-     *
-     * CHHapticPattern* pattern = [[CHHapticPattern alloc] initWithEvents:@[event] parameters:@[] error:&error];
-     * id<CHHapticPatternPlayer> player = [engine createPlayerWithPattern:pattern error:&error];
-     * [player startAtTime:CHHapticTimeImmediate error:&error];
-     * @endcode
-     */
+    if (@available(macOS 10.15, *)) {
+        if (!g_hapticEngine) {
+            NSError* error = nil;
+            g_hapticEngine = [[CHHapticEngine alloc] initAndReturnError:&error];
+            if (!error && g_hapticEngine) {
+                [g_hapticEngine startAndReturnError:&error];
+                if (!error) g_hapticEngineStarted = true;
+            }
+        }
+        
+        if (g_hapticEngineStarted) {
+            NSError* error = nil;
+            CHHapticEventParameter* intensityParam =
+                [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticIntensity
+                                                             value:intensity];
+            CHHapticEventParameter* sharpnessParam =
+                [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticSharpness
+                                                             value:sharpness];
+            CHHapticEvent* event =
+                [[CHHapticEvent alloc] initWithEventType:CHHapticEventTypeHapticTransient
+                                             parameters:@[intensityParam, sharpnessParam]
+                                           relativeTime:0
+                                               duration:duration];
+            
+            CHHapticPattern* pattern = [[CHHapticPattern alloc] initWithEvents:@[event] parameters:@[] error:&error];
+            id<CHHapticPatternPlayer> player = [g_hapticEngine createPlayerWithPattern:pattern error:&error];
+            [player startAtTime:CHHapticTimeImmediate error:&error];
+        }
+    }
 }
-
 
 // ===========================================================================
 // Frame Integration
@@ -278,17 +386,8 @@ void MQ_PlayHaptic(float intensity, float sharpness, float duration) {
  * 1. Cursor state (show/hide)
  * 2. Controller polling
  * 3. Mouse deltas → view angles (via IN_Move path)
- *
- * @note Currently, the actual IN_Move call path goes through in_null.c.
- *       Phase 2 will route through MQ_ApplyMouseToView instead.
  */
 void MQ_InputFrame(void) {
     MQ_UpdateCursorState();
     MQ_PollController();
-
-    /**
-     * @todo Phase 2: Replace in_null.c IN_Move with MQ_ApplyMouseToView.
-     * @todo Phase 2: Apply controller right stick to viewangles.
-     * @todo Phase 2: Map controller buttons to key events.
-     */
 }

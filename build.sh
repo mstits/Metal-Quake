@@ -17,7 +17,7 @@ LDFLAGS="$LDFLAGS -Wl,-weak_framework,MetalFX"
 LDFLAGS="$LDFLAGS -Wl,-weak_framework,PHASE"
 LDFLAGS="$LDFLAGS -framework CoreML -framework GameKit"
 # Apple-native frameworks for improvements
-LDFLAGS="$LDFLAGS -framework Accelerate -framework MetalPerformanceShaders -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework NaturalLanguage"
+LDFLAGS="$LDFLAGS -framework Accelerate -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework NaturalLanguage"
 
 # Common source files
 COMMON_SOURCES=(
@@ -211,5 +211,35 @@ echo "Linking..."
 $CXX "${OBJ_FILES[@]}" -o quake_metal $LDFLAGS -framework SwiftUI -L$(xcrun --toolchain default --show-sdk-platform-path)/../../lib/swift/macosx -lswiftCore 2>/dev/null || \
 $CXX "${OBJ_FILES[@]}" -o quake_metal $LDFLAGS 2>&1
 
-echo "Build complete! Binary: ./quake_metal"
-echo "Note: Ensure id1/pak0.pak is available for testing."
+echo "Creating App Bundle for Game Mode..."
+rm -rf build/Quake.app
+mkdir -p build/Quake.app/Contents/MacOS
+mkdir -p build/Quake.app/Contents/Resources
+cp quake_metal build/Quake.app/Contents/MacOS/Quake
+if [ -f "quake_rt.metallib" ]; then
+    cp quake_rt.metallib build/Quake.app/Contents/Resources/
+fi
+
+cat << 'EOF' > build/Quake.app/Contents/Info.plist
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>Quake</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.metalquake.engine</string>
+    <key>CFBundleName</key>
+    <string>Metal Quake</string>
+    <key>CFBundleVersion</key>
+    <string>1.0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.games</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
+echo "Build complete! Binary: build/Quake.app"
+echo "Note: Ensure id1/pak0.pak is available for testing. Run with: open build/Quake.app"

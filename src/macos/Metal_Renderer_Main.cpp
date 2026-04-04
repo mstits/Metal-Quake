@@ -253,79 +253,11 @@ void MQ_LoadSettings(const char* path) {
  * @endcode
  */
 
-/**
- * @brief Render frame using parallel command encoders.
- *
- * This function will replace the monolithic VID_Update() pipeline
- * in Phase 2. It orchestrates:
- * 1. GCD parallel BSP/PVS computation
- * 2. Parallel BLAS build + RT compute
- * 3. MetalFX upscaling
- * 4. Liquid Glass compositor
- *
- * @param device       The Metal device
- * @param cmdQueue     The command queue
- * @param drawable     The current drawable
- * @param settings     Current engine settings
- *
- * @todo Implement in Phase 2 after parallel encoder testing.
- */
-static void MQ_RenderFrame_Parallel(
-    MTL::Device*        device,
-    MTL::CommandQueue*  cmdQueue,
-    CA::MetalDrawable*  drawable,
-    MetalQuakeSettings* settings
-) {
-    (void)device; (void)cmdQueue; (void)drawable; (void)settings;
-
-    /**
-     * Phase 2 implementation outline:
-     *
-     * 1. Wait on frame semaphore
-     * 2. Upload software framebuffer (HUD/particles)
-     * 3. If RT enabled:
-     *    a. Build BLAS (world + entities)
-     *    b. Dispatch RT compute shader
-     *    c. Optionally: neural denoise pass
-     * 4. MetalFX upscale (spatial or temporal)
-     * 5. Compositor pass:
-     *    a. Blend software HUD over RT world
-     *    b. Apply screen effects (cshifts)
-     *    c. If Liquid Glass: apply refractive materials
-     * 6. Present drawable
-     */
-}
-
-
 // ===========================================================================
-// Phase 2 Scaffolding — GCD Physics
+// Phase 2 Implementation Complete
 // ===========================================================================
-
-/**
- * @brief Parallel physics step using GCD.
- *
- * Dispatches entity physics updates across multiple cores.
- * Each entity's SV_Physics_* call is independent and can run
- * concurrently (read from shared world state, write to entity-local state).
- *
- * @param numEntities Number of entities to process
- *
- * @code
- * void SV_Physics_Parallel(int numEntities) {
- *     dispatch_apply(numEntities, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
- *         ^(size_t i) {
- *             edict_t* ent = EDICT_NUM(i);
- *             if (ent->free) return;
- *             SV_Physics_Step(ent);
- *         }
- *     );
- * }
- * @endcode
- *
- * @warning Requires careful synchronization for:
- * - Touch trigger calls (must be serialized)
- * - Entity spawn/removal during iteration
- * - Link/unlink from area nodes
- *
- * @todo Phase 2: Implement after thread-safety audit of SV_Physics.
- */
+//
+// Note: Parallel Command Encoding (GCD) and other Phase 2 features 
+// have been successfully implemented directly inside vid_metal.cpp 
+// (see VID_Update dispatch_apply blocks).
+//

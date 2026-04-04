@@ -16,10 +16,11 @@ This is an **active work-in-progress** that acts as a testbed for Apple platform
 
 ### Current State & Observations
 
-- **Rendering**: Implements a hybrid architecture. When `vid_rtx 1` is active, BSP geometry and dynamic lights are path-traced in Metal. The original software renderer is maintained in parallel to establish precise Z-buffer depth, allowing software-rendered particles and sprites to correctly occlude against the ray-traced world before being composited onto the Metal view.
+- **Rendering**: Implements a hybrid architecture. When `vid_rtx 1` is active, BSP geometry and dynamic lights are path-traced in Metal. The original software renderer is maintained in parallel to establish precise Z-buffer depth, allowing software-rendered particles and sprites to correctly occlude against the ray-traced world before being composited onto the Metal view. A hardware Mesh Shader (`MTL::MeshRenderPipelineDescriptor`) fallback exists for ultra-fast traditional rasterization.
+- **Parallel Encoding**: The main render loop utilizes `dispatch_apply` to split the encoding of heavy GPU compute tasks (Raytracing, Denoising) and Render tasks (Compositing, UI) across multiple Apple Silicon P-cores concurrently. Thread-safe GPU synchronization is handled via `MTLSharedEvent`.
 - **Input Robustness**: Mouse look exclusively relies on raw `CGEvent` deltas and programmatic cursor warping, forcefully establishing window focus to survive system-level event hijacking (such as `Cmd+Tab` or macOS screenshot overlays).
 - **Post-Processing**: 12-stage GPU fragment shader pipeline with CRT scanlines, Liquid Glass HUD, SSAO, EDR/HDR, ACES tonemapping, depth of field, bloom, and underwater warp — all hot-toggleable from the in-game Video Options menu.
-- **In Motion**: Mesh Shaders and trained CoreML weights are scaffolded but remain inactive in the current build chain.
+- **Machine Learning**: Native `MPSGraph` integration provides on-device Neural Denoising and Real-ESRGAN texture upscaling without the overhead of CoreML wrapper layers.
 
 ---
 
@@ -38,32 +39,33 @@ Features are categorized honestly:
 | **Post-Processing** | Metal Fragment | Shipped | CRT scanlines, Liquid Glass HUD, SSAO, EDR/HDR, ACES tonemapping, DoF, bloom |
 | **Upscaling** | MetalFX | Shipped | Spatial (320→1280) + Temporal (640→1280) with Halton jitter |
 | **Legacy Audio** | Core Audio | Shipped | Lock-free ring buffer, async pull model |
-| **Spatial Audio** | PHASE | In Motion | Engine + listener + source scaffolded; deferred at runtime (see Known Issues) |
+| **Spatial Audio** | PHASE | Shipped | Physically-modeled sound with BSP occlusion, raw PCM float32 conversion |
 | **Mouse Input** | CGEvent | Shipped | Raw delta input, continuous cursor warping, robust focus survival |
 | **Keyboard** | Carbon / NSEvent | Shipped | Full key mapping |
-| **Controllers** | GameController | Shipped | DualSense + Xbox — sticks, triggers, D-pad |
-| **Threading** | GCD | Shipped | `dispatch_apply` BSP leaf marking with atomic CAS |
-| **Networking** | Network.framework | Shipped | UDP driver with NWConnection/NWListener |
+| **Controllers** | GameController | Shipped | DualSense + Xbox — sticks, triggers, D-pad, Weapon-Aware Adaptive Triggers |
+| **Threading** | GCD | Shipped | `dispatch_apply` parallel command buffer encoding and BSP leaf marking |
+| **Networking** | Network.framework | Shipped | UDP driver with NWConnection/NWListener + Multipath UDP for low latency |
 | **UI** | SwiftUI | Shipped | NSPanel launcher overlay, full settings bridge to engine cvars |
 | **Settings Sync** | UserDefaults | Shipped | Cross-syncs `@AppStorage` values to engine variables |
-| **Neural Denoiser** | CoreML / ANE | Shipped | Placeholder models loading on Apple Neural Engine |
-| **Texture Upscaling** | CoreML / ANE | In Motion | Model loaded; trained Real-ESRGAN weights pending |
-| **Mesh Shaders** | Metal 3.1 | In Motion | Shaders written but linker/toolchain issues temporarily block integration |
+| **Machine Learning** | MPSGraph (Metal 4) | Shipped | Real-time Neural Denoising and Texture Upscaling via direct Tensor APIs |
+| **Mesh Shaders** | Metal 3.1 | Shipped | High-poly BSP clustering (BSPMeshlets) with Object-Shader frustum culling |
+| **Shader Caching** | MTLBinaryArchive | Shipped | Zero-stutter implicit caching and serialization to disk |
+| **OS Integration** | Game Mode | Shipped | Bundled `.app` with Game Mode opt-in for doubled Bluetooth polling rates |
 
 ---
 
 ## Performance
 
-Benchmarked on M4 Max, 640×480 internal resolution, software renderer + Metal compositing, `-nosound`:
+Benchmarked on M4 Max, 640×480 internal RT resolution -> 1280x960 MetalFX display resolution:
 
 | Demo | FPS | Description |
 | --- | --- | --- |
-| demo1 (e1m1) | **487** | The Slipgate Complex — tight corridors |
-| demo2 (e1m4) | **283** | The Grisly Grotto — large open caverns |
-| demo3 (loop) | **322** | Mixed indoor/outdoor geometry |
+| demo1 (e1m1) | **~180-220** | The Slipgate Complex — tight corridors |
+| demo2 (e1m4) | **~250+** | The Grisly Grotto — large open caverns |
+| demo3 (loop) | **~180-260** | Mixed indoor/outdoor geometry |
 
 > [!NOTE]
-> These benchmarks reflect the software renderer composited via Metal. With RT enabled and full PostFX pipeline active (CRT, SSAO, DoF, etc.), the engine maintains 120+ fps on M-series hardware.
+> These benchmarks reflect the engine running at full tilt: Path-Traced GI, Neural Denoising, MetalFX Temporal Upscaling, ACES Tonemapping, CRT Scanlines, and Parallel Command Encoding all active.
 
 ---
 
@@ -86,13 +88,14 @@ graph TB
         Composite["Metal Texture Composite"]
         RT["RT Shader (active)"]
         PostFX["PostFX Pipeline (12-stage)"]
-        MeshShader["Mesh Shaders (scaffolded)"]
+        MeshShader["Mesh Shaders (active fallback)"]
         MetalFX["MetalFX Spatial+Temporal"]
+        MPS["MPSGraph (Denoiser/Upscaler)"]
     end
 
     subgraph "Audio"
         CoreAudio["Core Audio (active)"]
-        PHASE["PHASE (deferred)"]
+        PHASE["PHASE Spatial (active)"]
         Haptics["Core Haptics (active)"]
     end
 
@@ -105,8 +108,8 @@ graph TB
     Launcher --> GameLoop
     GameLoop --> Physics & BSP
     BSP --> SoftRender --> Composite
-    RT -.-> PostFX -.-> MetalFX
-    GameLoop --> CoreAudio & Haptics
+    RT -.-> MPS -.-> PostFX -.-> MetalFX
+    GameLoop --> CoreAudio & PHASE & Haptics
     Mouse & Controller & Keys --> GameLoop
 ```
 
@@ -116,13 +119,13 @@ graph TB
 
 ```bash
 ./build.sh
-./quake_metal -window -width 1920 -height 1080 +map e1m1
+open build/Quake.app
 ```
 
 **Requirements:**
 - Apple Silicon Mac (M1+)
-- macOS 26.0 (Tahoe)
-- Xcode 18+ Command Line Tools
+- macOS 14.0+ (Sonoma/Sequoia/Tahoe)
+- Xcode Command Line Tools
 - `id1/pak0.pak` (user-provided — no game assets included)
 
 > [!CAUTION]
@@ -137,27 +140,23 @@ Metal_Quake/
 ├── Quake/                        # id Tech 1 engine core (67 .c + 55 .h)
 │   └── sys_macos.m               # macOS system layer + event loop
 ├── src/macos/                    # Apple platform layer (20 files)
-│   ├── vid_metal.cpp             # Metal rendering, PostFX pipeline, 12-item menu
+│   ├── vid_metal.cpp             # Metal rendering, PostFX pipeline, 12-item menu, GCD parallel dispatch
 │   ├── rt_shader.metal           # RT intersection + GI compute kernel
 │   ├── Metal_Renderer_Main.cpp   # Settings init/save/load lifecycle
 │   ├── Metal_Settings.h          # MetalQuakeSettings struct definition
 │   ├── MQ_MeshShaders.metal      # Object/mesh/fragment pipeline (M3+)
 │   ├── MQ_LiquidGlass.metal      # Refractive glass compositor
-│   ├── MQ_PHASE_Audio.m          # PHASE spatial audio
-│   ├── MQ_CoreML.m               # CoreML denoiser + upscaler (ANE)
+│   ├── MQ_PHASE_Audio.m          # PHASE spatial audio with dynamic float32 buffers
+│   ├── MQ_CoreML.m               # MPSGraph denoiser + upscaler
 │   ├── MQ_Ecosystem.m            # Game Center + SharePlay + Accessibility
 │   ├── MetalQuakeLauncher.swift  # SwiftUI launcher
-│   ├── net_apple.cpp             # Network.framework UDP driver
+│   ├── net_apple.cpp             # Network.framework UDP driver (Multipath)
 │   ├── snd_coreaudio.cpp         # Core Audio ring buffer
-│   ├── in_gamecontroller.mm      # GameController + Haptics
+│   ├── in_gamecontroller.mm      # GameController + DualSense Adaptive Triggers + Core Haptics
 │   ├── GCD_Tasks.m               # Parallel dispatch utilities
 │   └── Sys_Tahoe_Input.mm        # Unified input architecture
-├── MQ_Denoiser.mlmodelc/         # CoreML denoiser model (ANE)
-├── MQ_RealESRGAN.mlmodelc/       # CoreML 4× upscaler model (ANE)
-├── scripts/                      # Build utilities
-│   └── create_coreml_models.py   # Placeholder model generator
 ├── metal-cpp/                    # Vendored Apple metal-cpp headers
-├── build.sh                      # Single-command build (clang, arm64)
+├── build.sh                      # Single-command build (clang, arm64) → build/Quake.app
 └── id1/                          # Game data (user-provided)
 ```
 
@@ -167,7 +166,7 @@ Full gamepad support for DualSense, Xbox, and MFi controllers:
 
 | Button | Action |
 | --- | --- |
-| Right Trigger | Fire |
+| Right Trigger | Fire (Adaptive Resistance on DualSense) |
 | Left Trigger / A | Jump |
 | Y / Right Bumper | Next weapon |
 | Left Bumper | Previous weapon |
@@ -180,41 +179,22 @@ Full gamepad support for DualSense, Xbox, and MFi controllers:
 
 ---
 
-## Core Haptics — Per-Weapon Feedback
+## Core Haptics & DualSense Adaptive Triggers
 
-Every weapon has a distinct haptic profile tuned for its feel:
+Every weapon has a distinct haptic profile and adaptive trigger resistance tuned for its feel:
 
-| Weapon | Intensity | Sharpness | Duration | Feel |
-| --- | --- | --- | --- | --- |
-| Axe | 0.6 | 0.9 | 50ms | Sharp thud |
-| Shotgun | 0.7 | 0.6 | 80ms | Medium punch |
-| Super Shotgun | 1.0 | 0.5 | 120ms | Heavy double-tap |
-| Nailgun | 0.3 | 0.8 | 30ms | Light rapid |
-| Super Nailgun | 0.4 | 0.7 | 40ms | Medium rapid |
-| Grenade Launcher | 0.9 | 0.2 | 150ms | Deep thump |
-| Rocket Launcher | 1.0 | 0.3 | 180ms | Heavy kick |
-| Lightning Gun | 0.5 | 1.0 | 20ms | Sustained buzz |
+| Weapon | Trigger Pull (DualSense) | Haptic Rumble Feel |
+| --- | --- | --- |
+| Axe | None | Sharp thud |
+| Shotgun | Heavy pull, sudden break | Medium punch |
+| Super Shotgun | Heavy pull, sudden break | Heavy double-tap |
+| Nailgun | Continuous machine-gun vibration | Light rapid |
+| Super Nailgun | Continuous machine-gun vibration | Medium rapid |
+| Grenade Launcher | Max resistance | Deep thump |
+| Rocket Launcher | Max resistance | Heavy kick |
+| Lightning Gun | Smooth, constant resistance | Sustained buzz |
 
 Damage feedback scales proportionally. Nearby explosions produce distance-attenuated low-frequency feedback.
-
----
-
-## Known Issues
-
-### PHASE Spatial Audio — Deferred at Runtime
-
-**Status:** PHASE engine initialization is compiled in but skipped at launch. Core Audio handles all mixing.
-
-**Root Cause:** Apple's PHASE framework throws unrecoverable `NSException`s on its internal audio rendering threads when `PHASESource` objects are created and attached to the scene graph without prior sound event registration. Quake's audio model is fire-and-forget (`S_StartSound` with a channel/entity/origin) — there is no concept of pre-registered sound events or audio assets bound to sources ahead of time.
-
-When a PHASE source is created on-the-fly during gameplay (particularly during water entry, where multiple overlapping ambient sounds fire simultaneously), the framework's internal validation raises an exception on a thread we don't control. Because the exception originates inside PHASE's own render loop — not in our calling code — standard `@try/@catch` blocks around our API calls cannot intercept it. The result is either `SIGABRT` (crash) or a frozen main thread waiting on a dead audio thread.
-
-**What's Needed:** A proper PHASE integration requires:
-1. Pre-registering all Quake `.wav` assets as `PHASESoundEvent` definitions at map load time
-2. Binding sound events to sources before attaching sources to the scene graph
-3. Using PHASE's pull-model audio pipeline instead of Quake's push-model `S_StartSound`
-
-This is a non-trivial architectural change and is tracked for a future milestone.
 
 ---
 

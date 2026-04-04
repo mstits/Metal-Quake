@@ -21,6 +21,8 @@ extern "C" {
 #include <objc/message.h>
 #include <stdlib.h>
 #include <vector>
+#include <string>
+#include <fstream>
 
 #include "vid_metal.hpp"
 #include "Metal_Settings.h"
@@ -153,7 +155,7 @@ struct GPUDynLight {
 };
 static int _numActiveLights = 0;
 
-struct TriTexInfo {
+struct alignas(32) TriTexInfo {
     float atlas_u, atlas_v;    // atlas offset (normalized)
     float atlas_w, atlas_h;    // atlas region size (normalized)
     float tex_w, tex_h;        // original texture size (pixels)
@@ -163,6 +165,19 @@ struct TriTexInfo {
 static std::vector<RTVertex> _worldVertices;
 static std::vector<uint32_t> _worldIndices;
 static std::vector<TriTexInfo> _worldTriTexInfos;
+
+struct BSPMeshlet {
+    uint32_t vertexOffset;      // Into global vertex buffer
+    uint32_t vertexCount;       // Verts in this meshlet (max 64)
+    uint32_t indexOffset;       // Into global index buffer
+    uint32_t triangleCount;     // Tris in this meshlet (max 126)
+    float boundingSphere[4];  // xyz=center, w=radius (for culling)
+    float coneApex[4];        // For backface cone culling
+    float coneAxis[4];        // xyz=axis, w=cutoff
+};
+static std::vector<BSPMeshlet> _worldMeshlets;
+static MTL::Buffer* _pMeshletBuffer = nullptr;
+static MTL::RenderPipelineState* _pMeshPipelineState = nullptr;
 static bool _worldGeomBuilt = false;
 
 // Per-triangle animation tracking: base texture pointer for animated surfaces
@@ -399,6 +414,39 @@ static void BuildRTXWorld() {
     }
     
     if (vertices.empty()) return;
+    
+    // === Phase 2a: Cluster BSP geometry into Meshlets (Max 64 verts / 126 tris) ===
+    _worldMeshlets.clear();
+    const uint32_t MAX_VERTS = 64;
+    const uint32_t MAX_TRIS = 126;
+    
+    BSPMeshlet currentMeshlet = {};
+    currentMeshlet.vertexOffset = 0; // Absolute indexing for now
+    currentMeshlet.indexOffset = 0;
+    
+    for (size_t i = 0; i < indices.size(); i += 3) {
+        if (currentMeshlet.triangleCount >= MAX_TRIS) {
+            _worldMeshlets.push_back(currentMeshlet);
+            currentMeshlet = {};
+            currentMeshlet.indexOffset = (uint32_t)i;
+        }
+        currentMeshlet.triangleCount++;
+        // Rough bounding sphere for this naive chunking
+        uint32_t i0 = indices[i], i1 = indices[i+1], i2 = indices[i+2];
+        RTVertex& v0 = vertices[i0];
+        // Just expand a very loose bounding sphere for now
+        currentMeshlet.boundingSphere[0] = v0.position[0];
+        currentMeshlet.boundingSphere[1] = v0.position[1];
+        currentMeshlet.boundingSphere[2] = v0.position[2];
+        currentMeshlet.boundingSphere[3] = 9999.0f; // Disable culling to ensure correctness first
+        currentMeshlet.coneAxis[3] = -1.0f; // Disable cone culling
+    }
+    if (currentMeshlet.triangleCount > 0) {
+        _worldMeshlets.push_back(currentMeshlet);
+    }
+    
+    if (_pMeshletBuffer) _pMeshletBuffer->release();
+    _pMeshletBuffer = _pDevice->newBuffer(_worldMeshlets.data(), _worldMeshlets.size() * sizeof(BSPMeshlet), MTL::ResourceStorageModeShared);
     
     // === Phase 2b: Add entity (alias model) skins to atlas ===
     _skinAtlasCache.clear();
@@ -1097,8 +1145,78 @@ static void BuildPipeline() {
     auto* pDesc = MTL::RenderPipelineDescriptor::alloc()->init();
     pDesc->setVertexFunction(pVertexFn); pDesc->setFragmentFunction(pFragFn);
     pDesc->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
+    
+    // Setup MTLBinaryArchive for Zero-Stutter Shader Caching
+    NS::Error* pArchiveError = nullptr;
+    auto* pArchiveDesc = MTL::BinaryArchiveDescriptor::alloc()->init();
+    auto* archiveUrl = NS::URL::fileURLWithPath(NS::String::string("id1/quake_shader_cache.bin", NS::UTF8StringEncoding));
+    pArchiveDesc->setUrl(archiveUrl);
+    MTL::BinaryArchive* pArchive = _pDevice->newBinaryArchive(pArchiveDesc, &pArchiveError);
+    if (!pArchive) {
+        // Create an empty archive if it doesn't exist
+        pArchive = _pDevice->newBinaryArchive(nullptr, &pArchiveError);
+    }
+    
+    if (pArchive) {
+        NS::Array* archives = NS::Array::array((NS::Object*)pArchive);
+        ((void (*)(id, SEL, id))objc_msgSend)((id)pDesc, sel_registerName("setBinaryArchives:"), (id)archives);
+    }
+
     _pPipelineState = _pDevice->newRenderPipelineState(pDesc, &pError);
+    if (pArchive && _pPipelineState) {
+        ((void (*)(id, SEL, id, id))objc_msgSend)((id)pArchive, sel_registerName("addRenderPipelineFunctionsWithDescriptor:error:"), (id)pDesc, nullptr);
+    }
+    
     pVertexFn->release(); pFragFn->release();
+
+    if (MQ_GetSettings()->mesh_shaders) {
+        std::ifstream ifs("src/macos/MQ_MeshShaders.metal");
+        std::string content((std::istreambuf_iterator<char>(ifs)), (std::istreambuf_iterator<char>()));
+        if (!content.empty()) {
+            NS::String* meshSourceStr = NS::String::string(content.c_str(), NS::UTF8StringEncoding);
+            auto* pMeshLib = _pDevice->newLibrary(meshSourceStr, nullptr, &pError);
+            if (pError) {
+                printf("Mesh Shader Compile Error: %s\n", pError->localizedDescription()->utf8String());
+            } else {
+                auto* pObjFn = pMeshLib->newFunction(NS::String::string("bspObjectShader", NS::UTF8StringEncoding));
+                auto* pMeshFn = pMeshLib->newFunction(NS::String::string("bspMeshShader", NS::UTF8StringEncoding));
+                auto* pMeshFragFn = pMeshLib->newFunction(NS::String::string("bspMeshFragment", NS::UTF8StringEncoding));
+                
+                auto* pMeshDesc = MTL::MeshRenderPipelineDescriptor::alloc()->init();
+                pMeshDesc->setObjectFunction(pObjFn);
+                pMeshDesc->setMeshFunction(pMeshFn);
+                pMeshDesc->setFragmentFunction(pMeshFragFn);
+                pMeshDesc->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
+                pMeshDesc->setDepthAttachmentPixelFormat(MTL::PixelFormatR32Float); // If used
+                
+                if (pArchive) {
+                    NS::Array* archives = NS::Array::array((NS::Object*)pArchive);
+                    ((void (*)(id, SEL, id))objc_msgSend)((id)pMeshDesc, sel_registerName("setBinaryArchives:"), (id)archives);
+                }
+                
+                _pMeshPipelineState = _pDevice->newRenderPipelineState(pMeshDesc, MTL::PipelineOptionNone, nullptr, &pError);
+                if (pError) {
+                    printf("Mesh Pipeline Creation Error: %s\n", pError->localizedDescription()->utf8String());
+                } else {
+                    printf("Mesh Pipeline successfully created!\n");
+                    if (pArchive) {
+                        // The mesh pipeline descriptor might not be supported by addRenderPipelineFunctions directly in some headers
+                        // We skip explicit addition if not supported since the array binding implicitly caches in macOS 14+
+                    }
+                }
+                
+                pObjFn->release(); pMeshFn->release(); pMeshFragFn->release();
+                pMeshDesc->release();
+                pMeshLib->release();
+            }
+        }
+    }
+    
+    // Serialize the archive back to disk to ensure zero-stutter on next launch
+    if (pArchive) {
+        ((void (*)(id, SEL, id, id))objc_msgSend)((id)pArchive, sel_registerName("serializeToURL:error:"), (id)archiveUrl, nullptr);
+        pArchive->release();
+    }
 
     const char* rtShaderSource = R"(
         #include <metal_stdlib>
@@ -1702,144 +1820,202 @@ extern "C" void VID_Update(vrect_t *rects) {
     if (dispatch_semaphore_wait(_frameSemaphore, dispatch_time(DISPATCH_TIME_NOW, 1000 * NSEC_PER_MSEC)) != 0) { pPool->release(); return; }
     _currentFrame = (_currentFrame + 1) % MaxFramesInFlight;
     auto* pCurrentIdxTex = _pIndexTextures[_currentFrame];
-    pCurrentIdxTex->replaceRegion(MTL::Region(0, 0, vid.width, vid.height), 0, vid.buffer, vid.rowbytes);
     auto* pDrawable = (CA::MetalDrawable*)Sys_GetNextDrawable(_pMetalLayer);
     if (!pDrawable) { dispatch_semaphore_signal(_frameSemaphore); pPool->release(); return; }
-    auto* pCmd = _pCommandQueue->commandBuffer();
-    if (vid_rtx.value && _pRTComputeState && _pRTBLAS) {
-        // GPU-side wait: ensure BLAS build is complete before ray tracing
-        if (_rtBLASEvent && _rtBLASEventValue > 0) {
-            ((void (*)(id, SEL, id, uint64_t))objc_msgSend)((id)pCmd, 
-                sel_registerName("encodeWaitForEvent:value:"), (id)_rtBLASEvent, _rtBLASEventValue);
-        }
-        auto* pCompEnc = pCmd->computeCommandEncoder();
-        pCompEnc->setComputePipelineState(_pRTComputeState); pCompEnc->setTexture(_pRTOutputTexture, 0); pCompEnc->setAccelerationStructure(_pRTBLAS, 0);
-        if (_pTextureAtlas) pCompEnc->setTexture(_pTextureAtlas, 1);
-        extern refdef_t r_refdef; extern vec3_t vpn, vright, vup;
-        float fOrigin[4] = { r_refdef.vieworg[0], r_refdef.vieworg[1], r_refdef.vieworg[2], 0.0f };
-        float fForward[4] = { vpn[0], vpn[1], vpn[2], 0.0f };
-        float fRight[4] = { vright[0], vright[1], vright[2], 0.0f };
-        float fUp[4] = { vup[0], vup[1], vup[2], 0.0f };
-        pCompEnc->setBytes(&fOrigin, 16, 1); pCompEnc->setBytes(&fForward, 16, 2); pCompEnc->setBytes(&fRight, 16, 3); pCompEnc->setBytes(&fUp, 16, 4);
-        pCompEnc->setBuffer(_pRTVertexBuffer, 0, 5); pCompEnc->setBuffer(_pRTIndexBuffer, 0, 6);
-        if (_pTriTexInfoBuffer) pCompEnc->setBuffer(_pTriTexInfoBuffer, 0, 7);
-        if (_pDynLightBuffer) pCompEnc->setBuffer(_pDynLightBuffer, 0, 8);
-        else {
-            GPUDynLight dummy = {0,0,0,0};
-            pCompEnc->setBytes(&dummy, sizeof(dummy), 8);
-        }
-        pCompEnc->setBytes(&_numActiveLights, sizeof(int), 9);
-        float shaderTime = (float)realtime;
-        pCompEnc->setBytes(&shaderTime, sizeof(float), 10);
-        // MetalFX temporal: bind depth + motion textures
-        if (_pRTDepthTexture) pCompEnc->setTexture(_pRTDepthTexture, 2);
-        if (_pRTMotionTexture) pCompEnc->setTexture(_pRTMotionTexture, 3);
-        // Previous frame camera for motion vectors
-        pCompEnc->setBytes(&_prevCamOrigin, 16, 11);
-        pCompEnc->setBytes(&_prevCamForward, 16, 12);
-        pCompEnc->setBytes(&_prevCamRight, 16, 13);
-        pCompEnc->setBytes(&_prevCamUp, 16, 14);
-        pCompEnc->dispatchThreads(MTL::Size(_pRTOutputTexture->width(), _pRTOutputTexture->height(), 1), MTL::Size(_pRTComputeState->threadExecutionWidth(), _pRTComputeState->maxTotalThreadsPerThreadgroup() / _pRTComputeState->threadExecutionWidth(), 1));
-        pCompEnc->endEncoding();
-        // Save current camera as previous for next frame's motion vectors
-        memcpy(_prevCamOrigin, fOrigin, 16);
-        memcpy(_prevCamForward, fForward, 16);
-        memcpy(_prevCamRight, fRight, 16);
-        memcpy(_prevCamUp, fUp, 16);
-        _temporalReset = false;
-        _frameIndex++;
-        
-        // GPU bilateral denoiser — multi-pass À-trous wavelet filter
-        // 3 iterations at step widths 1, 2, 4 for multi-scale edge-aware denoising
-        if (_pDenoiseState && _pDenoiseScratch && MQ_GetSettings()->neural_denoise && _pRTOutputTexture) {
-            int stepWidths[] = {1, 2, 4};
-            MTL::Texture* readTex = _pRTOutputTexture;
-            MTL::Texture* writeTex = _pDenoiseScratch;
-            for (int pass = 0; pass < 3; pass++) {
-                auto* pDenEnc = pCmd->computeCommandEncoder();
-                pDenEnc->setComputePipelineState(_pDenoiseState);
-                pDenEnc->setTexture(readTex, 0);   // input
-                pDenEnc->setTexture(writeTex, 1);   // output
-                pDenEnc->setTexture(_pRTDepthTexture, 2); // depth for edge-stop
-                pDenEnc->setBytes(&stepWidths[pass], sizeof(int), 0);
-                pDenEnc->dispatchThreads(
-                    MTL::Size(readTex->width(), readTex->height(), 1),
-                    MTL::Size(_pDenoiseState->threadExecutionWidth(),
-                              _pDenoiseState->maxTotalThreadsPerThreadgroup() / _pDenoiseState->threadExecutionWidth(), 1));
-                pDenEnc->endEncoding();
-                // Ping-pong
-                MTL::Texture* tmp = readTex; readTex = writeTex; writeTex = tmp;
-            }
-            // If final result is in scratch, blit back to RT output
-            if (readTex == _pDenoiseScratch) {
-                auto* pBlit = pCmd->blitCommandEncoder();
-                pBlit->copyFromTexture(_pDenoiseScratch, _pRTOutputTexture);
-                pBlit->endEncoding();
-            }
-        }
+    
+    auto* pCmdCompute = _pCommandQueue->commandBuffer();
+    auto* pCmdRender = _pCommandQueue->commandBuffer();
+    pCmdCompute->enqueue();
+    pCmdRender->enqueue();
+    
+    static MTL::SharedEvent* _glitchSyncEvent = nullptr;
+    static uint64_t _glitchSyncValue = 0;
+    if (!_glitchSyncEvent) _glitchSyncEvent = _pDevice->newSharedEvent();
+    _glitchSyncValue++;
+    
+    dispatch_apply(2, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t threadIndex) {
+        if (threadIndex == 0) {
+            // --- Thread 0: Compute Pass (Raytracing, Denoising, MetalFX) ---
+            auto* pPool1 = NS::AutoreleasePool::alloc()->init();
+            if (vid_rtx.value && _pRTComputeState && _pRTBLAS) {
+                if (_rtBLASEvent && _rtBLASEventValue > 0) {
+                    ((void (*)(id, SEL, id, uint64_t))objc_msgSend)((id)pCmdCompute, 
+                        sel_registerName("encodeWaitForEvent:value:"), (id)_rtBLASEvent, _rtBLASEventValue);
+                }
+                auto* pCompEnc = pCmdCompute->computeCommandEncoder();
+                pCompEnc->setComputePipelineState(_pRTComputeState); pCompEnc->setTexture(_pRTOutputTexture, 0); pCompEnc->setAccelerationStructure(_pRTBLAS, 0);
+                if (_pTextureAtlas) pCompEnc->setTexture(_pTextureAtlas, 1);
+                extern refdef_t r_refdef; extern vec3_t vpn, vright, vup;
+                float fOrigin[4] = { r_refdef.vieworg[0], r_refdef.vieworg[1], r_refdef.vieworg[2], 0.0f };
+                float fForward[4] = { vpn[0], vpn[1], vpn[2], 0.0f };
+                float fRight[4] = { vright[0], vright[1], vright[2], 0.0f };
+                float fUp[4] = { vup[0], vup[1], vup[2], 0.0f };
+                pCompEnc->setBytes(&fOrigin, 16, 1); pCompEnc->setBytes(&fForward, 16, 2); pCompEnc->setBytes(&fRight, 16, 3); pCompEnc->setBytes(&fUp, 16, 4);
+                pCompEnc->setBuffer(_pRTVertexBuffer, 0, 5); pCompEnc->setBuffer(_pRTIndexBuffer, 0, 6);
+                if (_pTriTexInfoBuffer) pCompEnc->setBuffer(_pTriTexInfoBuffer, 0, 7);
+                if (_pDynLightBuffer) pCompEnc->setBuffer(_pDynLightBuffer, 0, 8);
+                else {
+                    GPUDynLight dummy = {0,0,0,0};
+                    pCompEnc->setBytes(&dummy, sizeof(dummy), 8);
+                }
+                pCompEnc->setBytes(&_numActiveLights, sizeof(int), 9);
+                float shaderTime = (float)realtime;
+                pCompEnc->setBytes(&shaderTime, sizeof(float), 10);
+                if (_pRTDepthTexture) pCompEnc->setTexture(_pRTDepthTexture, 2);
+                if (_pRTMotionTexture) pCompEnc->setTexture(_pRTMotionTexture, 3);
+                pCompEnc->setBytes(&_prevCamOrigin, 16, 11);
+                pCompEnc->setBytes(&_prevCamForward, 16, 12);
+                pCompEnc->setBytes(&_prevCamRight, 16, 13);
+                pCompEnc->setBytes(&_prevCamUp, 16, 14);
+                pCompEnc->dispatchThreads(MTL::Size(_pRTOutputTexture->width(), _pRTOutputTexture->height(), 1), MTL::Size(_pRTComputeState->threadExecutionWidth(), _pRTComputeState->maxTotalThreadsPerThreadgroup() / _pRTComputeState->threadExecutionWidth(), 1));
+                pCompEnc->endEncoding();
+                
+                memcpy(_prevCamOrigin, fOrigin, 16);
+                memcpy(_prevCamForward, fForward, 16);
+                memcpy(_prevCamRight, fRight, 16);
+                memcpy(_prevCamUp, fUp, 16);
+                _temporalReset = false;
+                _frameIndex++;
+                
+                if (MQ_GetSettings()->neural_denoise && _pRTOutputTexture && _pDenoiseScratch) {
+                    int denoiseResult = MQ_CoreML_Denoise((void*)_pRTOutputTexture, (void*)_pDenoiseScratch, _pRTOutputTexture->width(), _pRTOutputTexture->height());
+                    if (denoiseResult == 0) {
+                        auto* pBlit = pCmdCompute->blitCommandEncoder();
+                        pBlit->copyFromTexture(_pDenoiseScratch, _pRTOutputTexture);
+                        pBlit->endEncoding();
+                    } else if (_pDenoiseState) {
+                        int stepWidths[] = {1, 2, 4};
+                        MTL::Texture* readTex = _pRTOutputTexture;
+                        MTL::Texture* writeTex = _pDenoiseScratch;
+                        for (int pass = 0; pass < 3; pass++) {
+                            auto* pDenEnc = pCmdCompute->computeCommandEncoder();
+                            pDenEnc->setComputePipelineState(_pDenoiseState);
+                            pDenEnc->setTexture(readTex, 0);
+                            pDenEnc->setTexture(writeTex, 1);
+                            pDenEnc->setTexture(_pRTDepthTexture, 2);
+                            pDenEnc->setBytes(&stepWidths[pass], sizeof(int), 0);
+                            pDenEnc->dispatchThreads(
+                                MTL::Size(readTex->width(), readTex->height(), 1),
+                                MTL::Size(_pDenoiseState->threadExecutionWidth(),
+                                          _pDenoiseState->maxTotalThreadsPerThreadgroup() / _pDenoiseState->threadExecutionWidth(), 1));
+                            pDenEnc->endEncoding();
+                            MTL::Texture* tmp = readTex; readTex = writeTex; writeTex = tmp;
+                        }
+                        if (readTex == _pDenoiseScratch) {
+                            auto* pBlit = pCmdCompute->blitCommandEncoder();
+                            pBlit->copyFromTexture(_pDenoiseScratch, _pRTOutputTexture);
+                            pBlit->endEncoding();
+                        }
+                    }
+                }
 
-        // MetalFX Temporal Upscaling — after denoise, before compositor
-        if (_pTemporalScaler && _pMFXOutputTexture && _pRTDepthTexture && _pRTMotionTexture &&
-            MQ_GetSettings()->metalfx_mode == MQ_METALFX_TEMPORAL) {
-            // Halton(2,3) jitter sequence for temporal stability
-            static const float haltonX[] = {0.5f, 0.25f, 0.75f, 0.125f, 0.625f, 0.375f, 0.875f, 0.0625f};
-            static const float haltonY[] = {0.333f, 0.667f, 0.111f, 0.444f, 0.778f, 0.222f, 0.556f, 0.889f};
-            int jIdx = _frameIndex % 8;
-            _pTemporalScaler->setColorTexture(_pRTOutputTexture);
-            _pTemporalScaler->setDepthTexture(_pRTDepthTexture);
-            _pTemporalScaler->setMotionTexture(_pRTMotionTexture);
-            _pTemporalScaler->setOutputTexture(_pMFXOutputTexture);
-            _pTemporalScaler->setInputContentWidth(_pRTOutputTexture->width());
-            _pTemporalScaler->setInputContentHeight(_pRTOutputTexture->height());
-            _pTemporalScaler->setJitterOffsetX(haltonX[jIdx] - 0.5f);
-            _pTemporalScaler->setJitterOffsetY(haltonY[jIdx] - 0.5f);
-            _pTemporalScaler->setReset(_temporalReset);
-            _pTemporalScaler->encodeToCommandBuffer(pCmd);
-        }
-    }
-    auto* pRpd = MTL::RenderPassDescriptor::alloc()->init();
-    // Render directly into the drawable — GPU texture sampling upscales 320x240 → 640x480
-    pRpd->colorAttachments()->object(0)->setTexture(pDrawable->texture()); pRpd->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionDontCare); pRpd->colorAttachments()->object(0)->setStoreAction(MTL::StoreActionStore);
-    auto* pEnc = pCmd->renderCommandEncoder(pRpd);
-    pEnc->setRenderPipelineState(_pPipelineState); pEnc->setFragmentTexture(pCurrentIdxTex, 0); pEnc->setFragmentTexture(_pPaletteTexture, 1); pEnc->setFragmentTexture(_pRTOutputTexture, 2); pEnc->setFragmentTexture(_pRTDepthTexture, 3);
-    // Compute PostFX uniforms: screen blend + time + underwater + CRT + Liquid Glass
-    struct { float screenBlend[4]; float time; float underwater; float crt_mode; float liquid_glass;
-             float resolution[2]; float ssao_enabled; float edr_enabled; } postfx;
-    memset(&postfx, 0, sizeof(postfx));
-    {
-        float r = 0, g = 0, b = 0, a = 0;
-        for (int j = 0; j < NUM_CSHIFTS; j++) {
-            float a2 = cl.cshifts[j].percent / 255.0f;
-            if (a2 <= 0) continue;
-            a = a + a2 * (1.0f - a);
-            if (a > 0) {
-                float blend = a2 / a;
-                r = r * (1.0f - blend) + cl.cshifts[j].destcolor[0] * blend;
-                g = g * (1.0f - blend) + cl.cshifts[j].destcolor[1] * blend;
-                b = b * (1.0f - blend) + cl.cshifts[j].destcolor[2] * blend;
+                if (_pTemporalScaler && _pMFXOutputTexture && _pRTDepthTexture && _pRTMotionTexture &&
+                    MQ_GetSettings()->metalfx_mode == MQ_METALFX_TEMPORAL) {
+                    static const float haltonX[] = {0.5f, 0.25f, 0.75f, 0.125f, 0.625f, 0.375f, 0.875f, 0.0625f};
+                    static const float haltonY[] = {0.333f, 0.667f, 0.111f, 0.444f, 0.778f, 0.222f, 0.556f, 0.889f};
+                    int jIdx = _frameIndex % 8;
+                    _pTemporalScaler->setColorTexture(_pRTOutputTexture);
+                    _pTemporalScaler->setDepthTexture(_pRTDepthTexture);
+                    _pTemporalScaler->setMotionTexture(_pRTMotionTexture);
+                    _pTemporalScaler->setOutputTexture(_pMFXOutputTexture);
+                    _pTemporalScaler->setInputContentWidth(_pRTOutputTexture->width());
+                    _pTemporalScaler->setInputContentHeight(_pRTOutputTexture->height());
+                    _pTemporalScaler->setJitterOffsetX(haltonX[jIdx] - 0.5f);
+                    _pTemporalScaler->setJitterOffsetY(haltonY[jIdx] - 0.5f);
+                    _pTemporalScaler->setReset(_temporalReset);
+                    _pTemporalScaler->encodeToCommandBuffer(pCmdCompute);
+                }
             }
+            
+            ((void (*)(id, SEL, id, uint64_t))objc_msgSend)((id)pCmdCompute, 
+                sel_registerName("encodeSignalEvent:value:"), (id)_glitchSyncEvent, _glitchSyncValue);
+                
+            pCmdCompute->commit();
+            pPool1->release();
+        } else if (threadIndex == 1) {
+            // --- Thread 1: UI Upload & Render Pass (Compositing, Mesh Rasterization) ---
+            auto* pPool2 = NS::AutoreleasePool::alloc()->init();
+            
+            pCurrentIdxTex->replaceRegion(MTL::Region(0, 0, vid.width, vid.height), 0, vid.buffer, vid.rowbytes);
+            
+            ((void (*)(id, SEL, id, uint64_t))objc_msgSend)((id)pCmdRender, 
+                sel_registerName("encodeWaitForEvent:value:"), (id)_glitchSyncEvent, _glitchSyncValue);
+                
+            auto* pRpd = MTL::RenderPassDescriptor::alloc()->init();
+            pRpd->colorAttachments()->object(0)->setTexture(pDrawable->texture()); pRpd->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionDontCare); pRpd->colorAttachments()->object(0)->setStoreAction(MTL::StoreActionStore);
+            
+            auto* pEnc = pCmdRender->renderCommandEncoder(pRpd);
+            pEnc->setRenderPipelineState(_pPipelineState); pEnc->setFragmentTexture(pCurrentIdxTex, 0); pEnc->setFragmentTexture(_pPaletteTexture, 1); pEnc->setFragmentTexture(_pRTOutputTexture, 2); pEnc->setFragmentTexture(_pRTDepthTexture, 3);
+            
+            struct { float screenBlend[4]; float time; float underwater; float crt_mode; float liquid_glass;
+                     float resolution[2]; float ssao_enabled; float edr_enabled; } postfx;
+            memset(&postfx, 0, sizeof(postfx));
+            {
+                float r = 0, g = 0, b = 0, a = 0;
+                for (int j = 0; j < NUM_CSHIFTS; j++) {
+                    float a2 = cl.cshifts[j].percent / 255.0f;
+                    if (a2 <= 0) continue;
+                    a = a + a2 * (1.0f - a);
+                    if (a > 0) {
+                        float blend = a2 / a;
+                        r = r * (1.0f - blend) + cl.cshifts[j].destcolor[0] * blend;
+                        g = g * (1.0f - blend) + cl.cshifts[j].destcolor[1] * blend;
+                        b = b * (1.0f - blend) + cl.cshifts[j].destcolor[2] * blend;
+                    }
+                }
+                postfx.screenBlend[0] = r / 255.0f;
+                postfx.screenBlend[1] = g / 255.0f;
+                postfx.screenBlend[2] = b / 255.0f;
+                postfx.screenBlend[3] = a > 1.0f ? 1.0f : (a < 0 ? 0 : a);
+            }
+            postfx.time = (float)realtime;
+            extern mleaf_t *r_viewleaf;
+            postfx.underwater = (MQ_GetSettings()->underwater_fx && r_viewleaf && r_viewleaf->contents <= CONTENTS_WATER) ? 1.0f : 0.0f;
+            postfx.crt_mode = MQ_GetSettings()->crt_mode ? 1.0f : 0.0f;
+            postfx.liquid_glass = MQ_GetSettings()->liquid_glass_ui ? 1.0f : 0.0f;
+            postfx.resolution[0] = (float)pDrawable->texture()->width();
+            postfx.resolution[1] = (float)pDrawable->texture()->height();
+            postfx.ssao_enabled = MQ_GetSettings()->ssao_enabled ? 1.0f : 0.0f;
+            postfx.edr_enabled = MQ_GetSettings()->edr_enabled ? 1.0f : 0.0f;
+            pEnc->setFragmentBytes(&postfx, sizeof(postfx), 0);
+            pEnc->drawPrimitives(MTL::PrimitiveTypeTriangle, (NS::UInteger)0, (NS::UInteger)3);
+            
+            if (!vid_rtx.value && MQ_GetSettings()->mesh_shaders && _pMeshPipelineState && _worldMeshlets.size() > 0) {
+                ((void (*)(id, SEL, id))objc_msgSend)((id)pEnc, sel_registerName("setRenderPipelineState:"), (id)_pMeshPipelineState);
+                if (_pRTVertexBuffer) {
+                    ((void (*)(id, SEL, id, NS::UInteger, NS::UInteger))objc_msgSend)((id)pEnc, sel_registerName("setVertexBuffer:offset:atIndex:"), (id)_pRTVertexBuffer, 0, 0);
+                    ((void (*)(id, SEL, id, NS::UInteger, NS::UInteger))objc_msgSend)((id)pEnc, sel_registerName("setObjectBuffer:offset:atIndex:"), (id)_pRTVertexBuffer, 0, 0);
+                    ((void (*)(id, SEL, id, NS::UInteger, NS::UInteger))objc_msgSend)((id)pEnc, sel_registerName("setMeshBuffer:offset:atIndex:"), (id)_pRTVertexBuffer, 0, 0);
+                }
+                if (_pRTIndexBuffer) {
+                    ((void (*)(id, SEL, id, NS::UInteger, NS::UInteger))objc_msgSend)((id)pEnc, sel_registerName("setMeshBuffer:offset:atIndex:"), (id)_pRTIndexBuffer, 0, 1);
+                }
+                if (_pMeshletBuffer) {
+                    ((void (*)(id, SEL, id, NS::UInteger, NS::UInteger))objc_msgSend)((id)pEnc, sel_registerName("setObjectBuffer:offset:atIndex:"), (id)_pMeshletBuffer, 0, 2);
+                    ((void (*)(id, SEL, id, NS::UInteger, NS::UInteger))objc_msgSend)((id)pEnc, sel_registerName("setMeshBuffer:offset:atIndex:"), (id)_pMeshletBuffer, 0, 2);
+                }
+                if (_pTextureAtlas) {
+                    ((void (*)(id, SEL, id, NS::UInteger))objc_msgSend)((id)pEnc, sel_registerName("setFragmentTexture:atIndex:"), (id)_pTextureAtlas, 0);
+                }
+                
+                MTL::Size threadgroupsPerGrid = MTL::Size(_worldMeshlets.size(), 1, 1);
+                MTL::Size threadsPerObjectThreadgroup = MTL::Size(1, 1, 1);
+                MTL::Size threadsPerMeshThreadgroup = MTL::Size(32, 1, 1);
+                
+                ((void (*)(id, SEL, MTL::Size, MTL::Size, MTL::Size))objc_msgSend)((id)pEnc, 
+                    sel_registerName("drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:"), 
+                    threadgroupsPerGrid, threadsPerObjectThreadgroup, threadsPerMeshThreadgroup);
+            }
+            
+            pEnc->endEncoding(); pRpd->release();
+            pCmdRender->presentDrawable(pDrawable); 
+            pCmdRender->addCompletedHandler([](MTL::CommandBuffer* pCmd) { dispatch_semaphore_signal(_frameSemaphore); });
+            pCmdRender->commit();
+            pPool2->release();
         }
-        postfx.screenBlend[0] = r / 255.0f;
-        postfx.screenBlend[1] = g / 255.0f;
-        postfx.screenBlend[2] = b / 255.0f;
-        postfx.screenBlend[3] = a > 1.0f ? 1.0f : (a < 0 ? 0 : a);
-    }
-    postfx.time = (float)realtime;
-    // Check if player's view leaf is underwater AND the setting is enabled
-    extern mleaf_t *r_viewleaf;
-    postfx.underwater = (MQ_GetSettings()->underwater_fx &&
-                         r_viewleaf && r_viewleaf->contents <= CONTENTS_WATER) ? 1.0f : 0.0f;
-    postfx.crt_mode = MQ_GetSettings()->crt_mode ? 1.0f : 0.0f;
-    postfx.liquid_glass = MQ_GetSettings()->liquid_glass_ui ? 1.0f : 0.0f;
-    postfx.resolution[0] = (float)pDrawable->texture()->width();
-    postfx.resolution[1] = (float)pDrawable->texture()->height();
-    postfx.ssao_enabled = MQ_GetSettings()->ssao_enabled ? 1.0f : 0.0f;
-    postfx.edr_enabled = MQ_GetSettings()->edr_enabled ? 1.0f : 0.0f;
-    pEnc->setFragmentBytes(&postfx, sizeof(postfx), 0);
-    pEnc->drawPrimitives(MTL::PrimitiveTypeTriangle, (NS::UInteger)0, (NS::UInteger)3);
-    pEnc->endEncoding(); pRpd->release();
-    pCmd->presentDrawable(pDrawable); pCmd->addCompletedHandler([](MTL::CommandBuffer* pCmd) { dispatch_semaphore_signal(_frameSemaphore); });
-    pCmd->commit(); pPool->release();
+    });
+    
+    pPool->release();
 }
 
 extern "C" int VID_SetMode(int modenum, unsigned char *palette) { return 1; }

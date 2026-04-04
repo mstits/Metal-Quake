@@ -56,13 +56,6 @@ static PHASEMaterial *waterMaterial = nil;
 // ---------------------------------------------------------------------------
 
 void MQ_PHASE_Init(void) {
-    // PHASE disabled: the framework throws unrecoverable exceptions on its
-    // internal audio threads when sources are created without proper sound
-    // event registration. Core Audio handles all mixing until PHASE
-    // integration is completed with full asset binding.
-    Con_Printf("PHASE: Deferred (Core Audio active)\n");
-    return;
-    
     if (phaseEngine) return;
     
     @autoreleasepool {
@@ -233,9 +226,88 @@ void MQ_PHASE_UpdateSource(int entityNum, float origin[3], float volume) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// BSP Occlusion Geometry
-// ---------------------------------------------------------------------------
+void MQ_PHASE_PlaySound(int entityNum, const char* soundName, void* pcmData, int numSamples, int channels, int sampleRate, int width, float volume) {
+    if (!phaseEngine || !phaseSources || phaseFaulted || !soundName || !pcmData) return;
+    
+    @autoreleasepool {
+        @try {
+            NSNumber *key = @(entityNum);
+            PHASESource *source = phaseSources[key];
+            if (!source) return; // Source should have been created by UpdateSource
+            
+            NSString *assetName = [NSString stringWithUTF8String:soundName];
+            
+            // Register audio buffer if not already registered
+            if (![phaseEngine.assetRegistry assetDescriptionForIdentifier:assetName]) {
+                AVAudioFormat *floatFormat = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32 sampleRate:sampleRate channels:channels interleaved:NO];
+                AVAudioPCMBuffer *buffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:floatFormat frameCapacity:numSamples];
+                buffer.frameLength = numSamples;
+                
+                float *floatData = buffer.floatChannelData[0];
+                if (width == 1) { // 8-bit unsigned
+                    uint8_t *src = (uint8_t*)pcmData;
+                    for (int i = 0; i < numSamples; i++) {
+                        floatData[i] = ((float)src[i] - 128.0f) / 128.0f;
+                    }
+                } else if (width == 2) { // 16-bit signed
+                    int16_t *src = (int16_t*)pcmData;
+                    for (int i = 0; i < numSamples; i++) {
+                        floatData[i] = (float)src[i] / 32768.0f;
+                    }
+                }
+                
+                NSError *error = nil;
+                [phaseEngine.assetRegistry registerAudioBuffer:buffer identifier:assetName modifier:nil error:&error];
+                if (error) {
+                    Con_Printf("PHASE: Failed to register buffer %s - %s\n", soundName, [[error localizedDescription] UTF8String]);
+                    return;
+                }
+            }
+            
+            // Create event node and sound event if we don't have it cached for this entity+sound combo
+            NSString *eventKey = [NSString stringWithFormat:@"%d_%s", entityNum, soundName];
+            PHASESoundEvent *event = phaseSoundEvents[eventKey];
+            
+            if (!event) {
+                // To keep it simple, we just use a basic sampler node
+                NSString *mixerId = [NSString stringWithFormat:@"mixer_%s", soundName];
+                PHASESpatialPipeline *pipeline = [[PHASESpatialPipeline alloc] initWithFlags:PHASESpatialPipelineFlagDirectPathTransmission | PHASESpatialPipelineFlagEarlyReflections | PHASESpatialPipelineFlagLateReverb];
+                PHASESpatialMixerDefinition *spatialMixer = [[PHASESpatialMixerDefinition alloc] initWithSpatialPipeline:pipeline identifier:mixerId];
+                PHASESamplerNodeDefinition *sampler = [[PHASESamplerNodeDefinition alloc] initWithSoundAssetIdentifier:assetName mixerDefinition:spatialMixer];
+                sampler.playbackMode = PHASEPlaybackModeOneShot;
+                
+                PHASESoundEventNodeDefinition *rootNode = sampler;
+                NSError *error = nil;
+                [phaseEngine.assetRegistry registerSoundEventAssetWithRootNode:rootNode identifier:eventKey error:&error];
+                
+                if (error) {
+                    Con_Printf("PHASE: Failed to register event %s - %s\n", soundName, [[error localizedDescription] UTF8String]);
+                    return;
+                }
+                
+                PHASEMixerParameters *mixerParams = [[PHASEMixerParameters alloc] init];
+                [mixerParams addSpatialMixerParametersWithIdentifier:mixerId source:source listener:phaseListener];
+                
+                PHASESoundEvent *newEvent = [[PHASESoundEvent alloc] initWithEngine:phaseEngine assetIdentifier:eventKey mixerParameters:mixerParams error:&error];
+                if (!error && newEvent) {
+                    phaseSoundEvents[eventKey] = newEvent;
+                    event = newEvent;
+                }
+            }
+            
+            if (event) {
+                [event startWithCompletionBlock:^(PHASESoundEventStartHandlerReason reason) {
+                    // done
+                }];
+            }
+            
+        } @catch (NSException *e) {
+            phaseFaulted = YES;
+            Con_Printf("PHASE: FATAL PlaySound — %s (spatial audio disabled)\n",
+                       [[e reason] UTF8String]);
+        }
+    }
+}
 
 void MQ_PHASE_BuildOcclusionFromBSP(void) {
     if (!phaseEngine) return;

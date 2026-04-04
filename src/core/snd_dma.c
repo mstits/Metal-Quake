@@ -501,6 +501,10 @@ void S_StartSound(int entnum, int entchannel, sfx_t *sfx, vec3_t origin, float f
 	target_chan->pos = 0.0;
     target_chan->end = paintedtime + sc->length;	
 
+	if (MQ_PHASE_IsEnabled()) {
+		MQ_PHASE_PlaySound(entnum, sfx->name, sc->data, sc->length, sc->stereo ? 2 : 1, sc->speed, sc->width, fvol);
+	}
+
 // if an identical sound has also been started this frame, offset the pos
 // a bit to keep it from just making the first one louder
 	check = &channels[NUM_AMBIENTS];
