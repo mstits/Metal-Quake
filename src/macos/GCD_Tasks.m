@@ -185,9 +185,15 @@ dispatch_queue_t MQ_GetBackgroundQueue(void) {
 // ---- Runtime Configuration ----
 
 int MQ_IsParallelEnabled(void) {
-    MetalQuakeSettings *s = MQ_GetSettings();
-    // Default to enabled if settings exist
-    return s ? 1 : 1; // Always enabled for now
+    // Parallelism is always available on Apple Silicon — this gate exists
+    // so serial paths remain reachable for debugging. Runtime toggling
+    // would need a mutable cvar; today it's baked at build time via the
+    // MQ_FORCE_SERIAL compile define.
+#ifdef MQ_FORCE_SERIAL
+    return 0;
+#else
+    return 1;
+#endif
 }
 
 int MQ_GetPCoreCount(void) {

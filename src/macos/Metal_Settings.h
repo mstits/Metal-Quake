@@ -73,7 +73,8 @@ typedef struct {
     /* ---- Audio ---- */
     MQAudioMode     audio_mode;         /**< Core Audio vs PHASE */
     int             spatial_audio;      /**< Personalized spatial audio (0/1) */
-    float           master_volume;      /**< Master volume (0.0–1.0) */
+    float           master_volume;      /**< Master (SFX) volume (0.0–1.0) */
+    float           music_volume;       /**< Music / bgmvolume (0.0–1.0) */
 
     /* ---- Input ---- */
     float           mouse_sensitivity;  /**< Mouse sensitivity (1.0–20.0) */
@@ -81,6 +82,12 @@ typedef struct {
     int             invert_y;           /**< Invert Y axis (0/1) */
     int             raw_mouse;          /**< Raw mouse input (0/1) */
     float           controller_deadzone;/**< Controller stick deadzone (0.0–0.5) */
+    float           haptic_intensity;   /**< DualSense haptic scale (0.0–1.0) */
+
+    /* ---- View ---- */
+    float           fov;                /**< Horizontal field of view (10–170) */
+    float           gamma;              /**< Screen gamma (0.5–1.5) */
+    float           hud_scale;          /**< HUD / sbar scale (1.0–3.0) */
 
     /* ---- Intelligence ---- */
     int             coreml_textures;    /**< CoreML texture upscaling (0/1) */

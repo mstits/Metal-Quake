@@ -5,6 +5,7 @@ build_cmake/
 *.o
 *.d
 quake_metal
+quake_rt.metallib
 *.dSYM/
 
 # Logs
@@ -32,5 +33,9 @@ DerivedData/
 # Game data (proprietary — not included)
 id1/
 
-# Temporary test files
-test*.c
+# Temporary test files (top-level one-offs; the tests/ dir IS tracked)
+/test_*.c
+/test_*.cpp
+/test_*.m
+/test_*.mm
+/a.out

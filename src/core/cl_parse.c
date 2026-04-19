@@ -947,13 +947,27 @@ void CL_ParseServerMessage (void)
 			cl.intermission = 1;
 			cl.completed_time = cl.time;
 			vid.recalc_refdef = true;	// go to full screen
+			// Game Center achievement hook — fires at map completion so
+			// leaderboards/achievements can observe the event. Safe to
+			// call on every intermission; the ecosystem module rate-limits
+			// and no-ops if Game Center isn't authenticated.
+			{
+				extern void MQ_Ecosystem_OnIntermission(const char *mapName, float completedTime);
+				MQ_Ecosystem_OnIntermission(cl.worldmodel ? cl.worldmodel->name : "",
+				                            cl.completed_time);
+			}
 			break;
 
 		case svc_finale:
 			cl.intermission = 2;
 			cl.completed_time = cl.time;
 			vid.recalc_refdef = true;	// go to full screen
-			SCR_CenterPrint (MSG_ReadString ());			
+			SCR_CenterPrint (MSG_ReadString ());
+			{
+				extern void MQ_Ecosystem_OnIntermission(const char *mapName, float completedTime);
+				MQ_Ecosystem_OnIntermission(cl.worldmodel ? cl.worldmodel->name : "",
+				                            cl.completed_time);
+			}
 			break;
 
 		case svc_cutscene:

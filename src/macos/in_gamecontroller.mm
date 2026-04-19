@@ -2,6 +2,8 @@
 #import <CoreHaptics/CoreHaptics.h>
 #import <AppKit/AppKit.h>
 
+#include "Metal_Settings.h"
+
 extern "C" {
     #define __QBOOLEAN_DEFINED__
     typedef int qboolean;
@@ -18,7 +20,16 @@ extern "C" {
 // ---------------------------------------------------------------------------
 static GCController *currentController = nil;
 static CHHapticEngine *hapticEngine = nil;
-static cvar_t joy_sensitivity = {(char*)"joy_sensitivity", (char*)"1.0", 1}; 
+static cvar_t joy_sensitivity  = {(char*)"joy_sensitivity", (char*)"1.0", 1};
+static cvar_t joy_gyro_enabled = {(char*)"joy_gyro_enabled", (char*)"0", 1};
+static cvar_t joy_gyro_yaw     = {(char*)"joy_gyro_yaw", (char*)"30.0", 1};
+static cvar_t joy_gyro_pitch   = {(char*)"joy_gyro_pitch", (char*)"20.0", 1};
+
+// Weapon-aware adaptive trigger state. The trigger resistance profile for
+// DualSense depends on the active weapon; we only reprogram on an edge
+// (weapon actually changed) to avoid spamming the controller at 120 Hz.
+static int      _lastActiveWeapon = -1;
+static NSTimeInterval _lastBatteryNagSec = 0;
 
 // ---------------------------------------------------------------------------
 // Haptics Setup
@@ -45,9 +56,17 @@ static void InitHaptics(GCController *controller) {
 // ---------------------------------------------------------------------------
 // Input Driver Methods
 // ---------------------------------------------------------------------------
+// Forward declarations for local helpers.
+static void ApplyWeaponAdaptiveTrigger(GCController *controller, int weapon);
+static void PollMotionSensor(void);
+static void CheckBatteryNag(GCController *controller);
+
 extern "C" void IN_Init(void) {
     Con_Printf("IN_Init: Initializing GameController...\n");
     Cvar_RegisterVariable(&joy_sensitivity);
+    Cvar_RegisterVariable(&joy_gyro_enabled);
+    Cvar_RegisterVariable(&joy_gyro_yaw);
+    Cvar_RegisterVariable(&joy_gyro_pitch);
 
     [[NSNotificationCenter defaultCenter] addObserverForName:GCControllerDidConnectNotification
                                                       object:nil
@@ -169,6 +188,102 @@ extern "C" void IN_Commands(void) {
     if (pad.dpad.down.isPressed)  Key_Event(K_DOWNARROW, 1); else Key_Event(K_DOWNARROW, 0);
     if (pad.dpad.left.isPressed)  Key_Event(K_LEFTARROW, 1); else Key_Event(K_LEFTARROW, 0);
     if (pad.dpad.right.isPressed) Key_Event(K_RIGHTARROW, 1); else Key_Event(K_RIGHTARROW, 0);
+
+    // Reprogram the DualSense right-trigger resistance when the player
+    // switches weapons. Also surface low-battery warnings and drive gyro
+    // aim when enabled via cvar.
+    int activeWeapon = cl.stats[STAT_ACTIVEWEAPON];
+    if (activeWeapon != _lastActiveWeapon) {
+        _lastActiveWeapon = activeWeapon;
+        ApplyWeaponAdaptiveTrigger(currentController, activeWeapon);
+    }
+    CheckBatteryNag(currentController);
+}
+
+// Reprogram the right trigger's adaptive resistance to match the weapon.
+// Called on weapon-switch edges only — setting the mode every frame would
+// saturate the DualSense's haptic bus and cause audible clicks.
+static void ApplyWeaponAdaptiveTrigger(GCController *controller, int weapon) {
+    if (!controller) return;
+    if (@available(macOS 11.3, *)) {
+        GCDualSenseGamepad *ds = (GCDualSenseGamepad *)controller.extendedGamepad;
+        if (![ds isKindOfClass:[GCDualSenseGamepad class]]) return;
+        GCDualSenseAdaptiveTrigger *rt = ds.rightTrigger;
+
+        // Weapon IDs are Quake IT_* bitflags: 1=Axe, 2=Shotgun, 4=SSG,
+        // 8=Nailgun, 16=Super Nailgun, 32=Grenade, 64=Rocket, 128=Lightning.
+        switch (weapon) {
+            case 1:   // Axe — no trigger resistance (melee, no trigger role)
+                [rt setModeOff];
+                break;
+            case 2:   // Shotgun — heavy break
+                [rt setModeWeaponWithStartPosition:0.25f endPosition:0.7f resistiveStrength:0.8f];
+                break;
+            case 4:   // Super Shotgun — heavier double-break
+                [rt setModeWeaponWithStartPosition:0.3f endPosition:0.8f resistiveStrength:1.0f];
+                break;
+            case 8:   // Nailgun — continuous machine-gun vibration
+                [rt setModeVibrationWithStartPosition:0.15f amplitude:0.4f frequency:20.0f];
+                break;
+            case 16:  // Super Nailgun — faster continuous vibration
+                [rt setModeVibrationWithStartPosition:0.15f amplitude:0.5f frequency:30.0f];
+                break;
+            case 32:  // Grenade Launcher — max resistance release
+                [rt setModeWeaponWithStartPosition:0.4f endPosition:0.9f resistiveStrength:1.0f];
+                break;
+            case 64:  // Rocket Launcher — max resistance
+                [rt setModeWeaponWithStartPosition:0.5f endPosition:1.0f resistiveStrength:1.0f];
+                break;
+            case 128: // Lightning Gun — smooth constant resistance
+                [rt setModeFeedbackWithStartPosition:0.1f resistiveStrength:0.6f];
+                break;
+            default:
+                [rt setModeOff];
+                break;
+        }
+    }
+}
+
+// Fold gyro sensor deltas into view angles when joy_gyro_enabled is set.
+// GCMotion is available on DualSense, Xbox Elite Series 2, and MFi
+// controllers that advertise motion. We read the rotationRate (rad/sec)
+// and integrate using the last Host frame time as a proxy step.
+static void PollMotionSensor(void) {
+    if (!currentController) return;
+    if (joy_gyro_enabled.value == 0.0f) return;
+    GCMotion *motion = currentController.motion;
+    if (!motion || !motion.hasRotationRate) return;
+
+    GCRotationRate r = motion.rotationRate;
+    // Scale radians/sec → degrees/frame. host_frametime is the canonical
+    // game tick from Quake's host.c (seconds since last tick).
+    extern double host_frametime;
+    const float dt = (float)host_frametime;
+    const float kRad2Deg = 57.29578f;
+
+    cl.viewangles[YAW]   -= (float)r.y * kRad2Deg * dt * joy_gyro_yaw.value;
+    cl.viewangles[PITCH] -= (float)r.x * kRad2Deg * dt * joy_gyro_pitch.value;
+    if (cl.viewangles[PITCH] > 80.0f)  cl.viewangles[PITCH] = 80.0f;
+    if (cl.viewangles[PITCH] < -70.0f) cl.viewangles[PITCH] = -70.0f;
+}
+
+// Print a low-battery warning to the console at most once per 60 seconds.
+// The controller's battery property is GCDeviceBattery (macOS 11+); older
+// systems don't expose it and we silently skip.
+static void CheckBatteryNag(GCController *controller) {
+    if (!controller) return;
+    if (@available(macOS 11.0, *)) {
+        GCDeviceBattery *bat = controller.battery;
+        if (!bat) return;
+        NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+        if (now - _lastBatteryNagSec < 60.0) return;
+        if (bat.batteryLevel >= 0.0f && bat.batteryLevel < 0.15f &&
+            bat.batteryState != GCDeviceBatteryStateCharging) {
+            _lastBatteryNagSec = now;
+            Con_Printf("Controller battery low: %d%%\n",
+                       (int)(bat.batteryLevel * 100.0f));
+        }
+    }
 }
 
 extern "C" void IN_Move(usercmd_t *cmd) {
@@ -210,11 +325,24 @@ extern "C" void IN_Move(usercmd_t *cmd) {
         // Right stick for looking
         if (fabs(rx) > 0.1f) cl.viewangles[YAW]   -= rx * 4.0f * joy_sensitivity.value;
         if (fabs(ry) > 0.1f) cl.viewangles[PITCH]  -= ry * 4.0f * joy_sensitivity.value;
+
+        // Gyro aim is additive on top of stick input — modern FPS style.
+        PollMotionSensor();
     }
 }
 
 extern "C" void IN_ClearStates(void) {
-    // Clear any virtual buttons if necessary
+    // Engine calls this on key_dest changes and map transitions to
+    // prevent stale button state from carrying across the boundary
+    // (e.g. trigger still "held" when a new map starts). We release the
+    // two action buttons the controller drives on the Quake side.
+    Key_Event(K_CTRL, 0);   // fire
+    Key_Event(K_SPACE, 0);  // jump
+    Key_Event('c', 0);      // swim down
+    Key_Event(K_UPARROW, 0);
+    Key_Event(K_DOWNARROW, 0);
+    Key_Event(K_LEFTARROW, 0);
+    Key_Event(K_RIGHTARROW, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -229,7 +357,16 @@ extern "C" void IN_ClearStates(void) {
  */
 static void PlayHapticTransient(float intensity, float sharpness, float duration) {
     if (!hapticEngine) return;
-    
+
+    // Apply the user's rumble-intensity slider. Default 1.0 preserves
+    // the original per-weapon tuning; lower values scale every rumble
+    // down uniformly for anyone who finds adaptive triggers / haptics
+    // distracting.
+    extern MetalQuakeSettings* MQ_GetSettings(void);
+    MetalQuakeSettings *mqs = MQ_GetSettings();
+    if (mqs) intensity *= mqs->haptic_intensity;
+    if (intensity <= 0.01f) return;
+
     NSError *error = nil;
     CHHapticEventParameter *pIntensity = [[CHHapticEventParameter alloc]
         initWithParameterID:CHHapticEventParameterIDHapticIntensity value:intensity];

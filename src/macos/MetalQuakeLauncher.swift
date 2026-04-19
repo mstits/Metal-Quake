@@ -11,6 +11,78 @@
 
 import SwiftUI
 import AppKit
+import GroupActivities
+
+// MARK: - SharePlay Group Activity
+
+// Declares a joinable Quake session as a GroupActivity. FaceTime picks
+// this up when the user starts a share and any of their call
+// participants can click "Join" to land in the same server. The C side
+// (MQ_Ecosystem.m) only ever flipped a flag; this is the real plumbing.
+@available(macOS 13.0, *)
+struct QuakeGroupActivity: GroupActivity {
+    let serverAddress: String   // e.g. "192.168.1.5:27500" or "host.example.com"
+    let mapName: String
+
+    static let activityIdentifier = "com.metalquake.sharedsession"
+
+    var metadata: GroupActivityMetadata {
+        var md = GroupActivityMetadata()
+        md.type    = .generic
+        md.title   = "Quake — \(mapName)"
+        md.subtitle = serverAddress
+        md.fallbackURL = URL(string: "https://github.com/mstits/Quake")
+        return md
+    }
+}
+
+// @objc(MQSharePlayManager) pins the Objective-C runtime name so the C
+// bridge's NSClassFromString(@"MQSharePlayManager") resolves without
+// having to chase the Swift module-mangled symbol. Needed because
+// the engine looks up this class by string name at startup.
+@available(macOS 13.0, *)
+@objc(MQSharePlayManager)
+public class MQSharePlayManager: NSObject {
+    @objc public static let shared = MQSharePlayManager()
+
+    @objc public func startSession(serverAddress: String, mapName: String) {
+        Task {
+            let activity = QuakeGroupActivity(serverAddress: serverAddress, mapName: mapName)
+            do {
+                switch await activity.prepareForActivation() {
+                case .activationPreferred:
+                    _ = try await activity.activate()
+                    NSLog("SharePlay: activated session for %@", serverAddress)
+                case .activationDisabled:
+                    NSLog("SharePlay: activation disabled (no FaceTime call in progress)")
+                case .cancelled:
+                    break
+                @unknown default:
+                    break
+                }
+            } catch {
+                NSLog("SharePlay: activation failed: %@", error.localizedDescription)
+            }
+        }
+    }
+
+    @objc public func observeIncoming() {
+        // Called from engine startup; registers a task that listens for
+        // remote-user session joins and wires them into the engine via
+        // `connect <address>`.
+        Task {
+            for await session in QuakeGroupActivity.sessions() {
+                let activity = session.activity
+                NSLog("SharePlay: joined session %@ → %@", activity.mapName, activity.serverAddress)
+                DispatchQueue.main.async {
+                    let cmd = "connect \(activity.serverAddress)"
+                    MQBridge_ConsoleCommand(cmd)
+                }
+                session.join()
+            }
+        }
+    }
+}
 
 // MARK: - C Bridge
 
@@ -36,13 +108,24 @@ class MQSettingsStore: ObservableObject {
     @AppStorage("mq_invertY") var invertY: Bool = false
     @AppStorage("mq_rawMouse") var rawMouse: Bool = true
     @AppStorage("mq_controllerDeadzone") var controllerDeadzone: Double = 0.15
-    
+    @AppStorage("mq_hapticIntensity") var hapticIntensity: Double = 1.0
+
     @AppStorage("mq_coremlTextures") var coremlTextures: Bool = false
     @AppStorage("mq_neuralBots") var neuralBots: Bool = false
-    
+
     @AppStorage("mq_soundSpatializer") var soundSpatializer: Bool = false
     @AppStorage("mq_highContrastHUD") var highContrastHUD: Bool = false
     @AppStorage("mq_subtitles") var subtitles: Bool = false
+
+    // View controls — exposed sliders for settings that already exist as
+    // engine cvars (fov, gamma) plus hud_scale which maps onto viewsize.
+    @AppStorage("mq_fov") var fov: Double = 90.0
+    @AppStorage("mq_gamma") var gamma: Double = 1.0
+    @AppStorage("mq_hudScale") var hudScale: Double = 1.0
+
+    // Separate music/SFX volumes so the user can keep gameplay audio
+    // loud while ducking the title/track music.
+    @AppStorage("mq_volumeMusic") var volumeMusic: Double = 0.5
 }
 
 // MARK: - Map Model
@@ -105,6 +188,7 @@ struct QuakeMap: Identifiable, Hashable {
 struct MetalQuakeLauncherView: View {
     @State private var selectedTab = 0
     @State private var selectedMap: QuakeMap? = nil
+    @State private var directConnectHost: String = ""
     @ObservedObject private var settings = MQSettingsStore.shared
     @State private var showingMapDetail = false
     @State private var animateIn = false
@@ -158,12 +242,54 @@ struct MetalQuakeLauncherView: View {
             
             Spacer()
             
-            // Status indicators
+            // Status indicators — live from settings + hardware detection
             HStack(spacing: 12) {
-                StatusPill(label: "12 P-Cores", icon: "cpu", color: .green)
-                StatusPill(label: "RT Active", icon: "rays", color: .orange)
-                StatusPill(label: "MetalFX 2×", icon: "arrow.up.right.and.arrow.down.left.rectangle.fill", color: .blue)
+                let pCoreCount: Int = {
+                    var count: Int32 = 0
+                    var size = MemoryLayout<Int32>.size
+                    sysctlbyname("hw.perflevel0.physicalcpu", &count, &size, nil, 0)
+                    return Int(count > 0 ? count : Int32(ProcessInfo.processInfo.activeProcessorCount))
+                }()
+                StatusPill(label: "\(pCoreCount) P-Cores", icon: "cpu", color: .green)
+                StatusPill(
+                    label: settings.rtEnabled ? "RT Active" : "RT Off",
+                    icon: "rays",
+                    color: settings.rtEnabled ? .orange : .secondary
+                )
+                StatusPill(
+                    label: {
+                        switch settings.metalfxMode {
+                        case 0: return "MetalFX Off"
+                        case 1: return "MetalFX Spatial"
+                        case 2: return "MetalFX Temporal"
+                        default: return "MetalFX ?"
+                        }
+                    }(),
+                    icon: "arrow.up.right.and.arrow.down.left.rectangle.fill",
+                    color: settings.metalfxMode == 0 ? .secondary : .blue
+                )
             }
+            Button {
+                MQBridge_ConsoleCommand("screenshot")
+            } label: {
+                Label("Screenshot", systemImage: "camera.viewfinder")
+                    .font(.system(size: 12, weight: .semibold))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+            }
+            .buttonStyle(.bordered)
+            .help("Writes to id1/quake00.pcx — requires an active map")
+
+            Button {
+                MQBridge_ToggleCvar("vid_fullscreen")
+            } label: {
+                Label("Fullscreen", systemImage: "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+            }
+            .buttonStyle(.bordered)
+
             // Resume button
             Button(action: resumeGame) {
                 Label("Resume", systemImage: "play.fill")
@@ -183,25 +309,28 @@ struct MetalQuakeLauncherView: View {
     
     var tabBar: some View {
         HStack(spacing: 0) {
-            TabButton(title: "Maps", icon: "map.fill", isSelected: selectedTab == 0) { selectedTab = 0 }
-            TabButton(title: "Settings", icon: "gearshape.fill", isSelected: selectedTab == 1) { selectedTab = 1 }
-            TabButton(title: "Multiplayer", icon: "person.2.fill", isSelected: selectedTab == 2) { selectedTab = 2 }
-            TabButton(title: "About", icon: "info.circle.fill", isSelected: selectedTab == 3) { selectedTab = 3 }
+            TabButton(title: "Maps",      icon: "map.fill",             isSelected: selectedTab == 0) { selectedTab = 0 }
+            TabButton(title: "Saves",     icon: "externaldrive.fill",    isSelected: selectedTab == 1) { selectedTab = 1 }
+            TabButton(title: "Demos",     icon: "film.fill",             isSelected: selectedTab == 2) { selectedTab = 2 }
+            TabButton(title: "Multiplayer", icon: "person.2.fill",        isSelected: selectedTab == 3) { selectedTab = 3 }
+            TabButton(title: "Settings",  icon: "gearshape.fill",       isSelected: selectedTab == 4) { selectedTab = 4 }
+            TabButton(title: "About",     icon: "info.circle.fill",     isSelected: selectedTab == 5) { selectedTab = 5 }
         }
         .padding(.horizontal, 24)
         .padding(.vertical, 8)
         .background(.bar)
     }
-    
+
     // MARK: - Tab Content
-    
     @ViewBuilder
     var tabContent: some View {
         switch selectedTab {
         case 0: mapGalleryView
-        case 1: settingsView
-        case 2: multiplayerView
-        case 3: aboutView
+        case 1: savesView
+        case 2: demosView
+        case 3: multiplayerView
+        case 4: settingsView
+        case 5: aboutView
         default: EmptyView()
         }
     }
@@ -291,14 +420,22 @@ struct MetalQuakeLauncherView: View {
                     SettingsToggle(title: "Mesh Shaders", subtitle: "Movie-quality geometry (M3+)", isOn: $settings.meshShaders)
                 }
                 
+                // View — camera and HUD presentation settings.
+                SettingsSection(title: "View", icon: "camera.viewfinder") {
+                    SettingsSlider(title: "Field of View", value: $settings.fov, range: 60...130)
+                    SettingsSlider(title: "Gamma",          value: $settings.gamma, range: 0.5...1.5)
+                    SettingsSlider(title: "HUD Scale",       value: $settings.hudScale, range: 1.0...3.0)
+                }
+
                 // Audio
                 SettingsSection(title: "Audio", icon: "speaker.wave.3.fill") {
                     SettingsPicker(title: "Audio Engine", selection: $settings.audioMode,
                                    options: ["Core Audio", "PHASE Spatial"])
                     SettingsToggle(title: "Spatial Audio", subtitle: "Personalized HRTF", isOn: $settings.spatialAudio)
-                    SettingsSlider(title: "Master Volume", value: $settings.masterVolume, range: 0...1)
+                    SettingsSlider(title: "SFX Volume",    value: $settings.masterVolume, range: 0...1)
+                    SettingsSlider(title: "Music Volume",   value: $settings.volumeMusic, range: 0...1)
                 }
-                
+
                 // Input
                 SettingsSection(title: "Input", icon: "gamecontroller.fill") {
                     SettingsSlider(title: "Mouse Sensitivity", value: $settings.mouseSensitivity, range: 1...20)
@@ -306,36 +443,64 @@ struct MetalQuakeLauncherView: View {
                     SettingsToggle(title: "Invert Y Axis", subtitle: "Inverted vertical look", isOn: $settings.invertY)
                     SettingsToggle(title: "Raw Mouse Input", subtitle: "CGEvent delta (recommended)", isOn: $settings.rawMouse)
                     SettingsSlider(title: "Controller Deadzone", value: $settings.controllerDeadzone, range: 0...0.5)
+                    SettingsSlider(title: "Rumble Intensity",    value: $settings.hapticIntensity, range: 0...1)
                 }
                 
-                // Intelligence
+                // Intelligence — Neural Bots removed (would require rewriting
+                // Quake's monster AI; outside the scope of this port). CoreML
+                // texture path kept because the asset-load upscaler wires
+                // through MQ_CoreML_UpscaleTexture when the toggle is on.
                 SettingsSection(title: "Intelligence", icon: "brain.fill") {
-                    SettingsToggle(title: "CoreML Textures", subtitle: "Real-ESRGAN upscaling (stretch goal)", isOn: $settings.coremlTextures)
-                    SettingsToggle(title: "Neural Bots", subtitle: "ANE-powered bot AI (stretch goal)", isOn: $settings.neuralBots)
+                    SettingsToggle(title: "CoreML Textures", subtitle: "Bilinear 4× stand-in for Real-ESRGAN", isOn: $settings.coremlTextures)
                 }
-                
-                // Accessibility
+
+                // Accessibility — Sound Spatializer removed (overlay was
+                // never plumbed through the renderer). HUD contrast and
+                // subtitles are wired to shader and console respectively.
                 SettingsSection(title: "Accessibility", icon: "accessibility") {
-                    SettingsToggle(title: "Sound Spatializer", subtitle: "Visual sound direction overlay", isOn: $settings.soundSpatializer)
-                    SettingsToggle(title: "High Contrast HUD", subtitle: "Enhanced visibility", isOn: $settings.highContrastHUD)
-                    SettingsToggle(title: "Subtitles", subtitle: "Event text descriptions", isOn: $settings.subtitles)
+                    SettingsToggle(title: "High Contrast HUD", subtitle: "Boost HUD saturation and contrast", isOn: $settings.highContrastHUD)
+                    SettingsToggle(title: "Subtitles", subtitle: "Log sound events to the console", isOn: $settings.subtitles)
                 }
             }
             .padding(24)
-            
+            // Hot-reload: apply settings live as sliders/toggles move so
+            // the user can see FOV / gamma / volumes update without
+            // returning to the game. Apply button still persists to
+            // disk (the onChange path only writes cvars, not the cfg file).
+            .onChange(of: settings.fov)                 { MQBridge_SyncSettings() }
+            .onChange(of: settings.gamma)               { MQBridge_SyncSettings() }
+            .onChange(of: settings.hudScale)            { MQBridge_SyncSettings() }
+            .onChange(of: settings.masterVolume)        { MQBridge_SyncSettings() }
+            .onChange(of: settings.volumeMusic)         { MQBridge_SyncSettings() }
+            .onChange(of: settings.mouseSensitivity)    { MQBridge_SyncSettings() }
+            .onChange(of: settings.controllerDeadzone)  { MQBridge_SyncSettings() }
+            .onChange(of: settings.hapticIntensity)     { MQBridge_SyncSettings() }
+            .onChange(of: settings.invertY)             { MQBridge_SyncSettings() }
+            .onChange(of: settings.rawMouse)            { MQBridge_SyncSettings() }
+
             // Apply + Resume buttons
             HStack(spacing: 16) {
+                Button(action: resetDefaults) {
+                    Label("Reset Defaults", systemImage: "arrow.uturn.backward")
+                        .font(.system(size: 13, weight: .medium))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.bordered)
+                .help("Revert every slider / toggle to the shipping default")
+
                 Spacer()
+
                 Button(action: resumeGame) {
-                    Label("Cancel", systemImage: "xmark")
+                    Label("Close", systemImage: "xmark")
                         .font(.system(size: 14, weight: .medium))
                         .padding(.horizontal, 20)
                         .padding(.vertical, 10)
                 }
                 .buttonStyle(.bordered)
-                
+
                 Button(action: applyAndResume) {
-                    Label("Apply & Resume", systemImage: "checkmark.circle.fill")
+                    Label("Save & Resume", systemImage: "checkmark.circle.fill")
                         .font(.system(size: 14, weight: .semibold))
                         .padding(.horizontal, 24)
                         .padding(.vertical, 10)
@@ -348,25 +513,217 @@ struct MetalQuakeLauncherView: View {
         }
     }
     
-    // MARK: - Multiplayer
-    
-    var multiplayerView: some View {
-        VStack(spacing: 20) {
-            Spacer()
-            Image(systemName: "network")
-                .font(.system(size: 48))
-                .foregroundStyle(.tertiary)
-            Text("Network.framework UDP")
-                .font(.system(size: 18, weight: .semibold, design: .monospaced))
-                .foregroundColor(.secondary)
-            Text("LAN discovery and server browser coming in Phase 3")
-                .font(.system(size: 14))
-                .foregroundStyle(.tertiary)
-            Spacer()
+    // MARK: - Saves
+    // Lists save files that live in id1/*.sav. Click-to-load dispatches
+    // the engine's `load` command through the bridge. The "Quick Save"
+    // button fires `save quick` which slots into id1/quick.sav.
+
+    var savesView: some View {
+        let count = Int(MQBridge_GetSaveSlotCount())
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    Text("Saved Games").font(.system(size: 16, weight: .bold, design: .monospaced))
+                    Spacer()
+                    Button {
+                        MQBridge_SaveCurrentGame("quick")
+                    } label: {
+                        Label("Quick Save", systemImage: "externaldrive.badge.plus")
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .padding(.horizontal, 24)
+
+                if count == 0 {
+                    Text("No saves yet. Quick Save writes to id1/quick.sav; the `save <name>` console command writes named slots.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .padding(24)
+                } else {
+                    LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 12) {
+                        ForEach(0..<count, id: \.self) { i in
+                            let name = String(cString: MQBridge_GetSaveSlotName(Int32(i)))
+                            let ts   = MQBridge_GetSaveSlotTimestamp(Int32(i))
+                            Button {
+                                MQBridge_LoadSaveSlot(Int32(i))
+                            } label: {
+                                HStack {
+                                    Image(systemName: "externaldrive.fill")
+                                        .foregroundColor(.orange)
+                                    VStack(alignment: .leading) {
+                                        Text(name).font(.system(size: 14, weight: .semibold))
+                                        if ts > 0 {
+                                            Text(Date(timeIntervalSince1970: ts), style: .date)
+                                                .font(.system(size: 11)).foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    Spacer()
+                                }
+                                .padding(10)
+                                .background(.ultraThinMaterial)
+                                .clipShape(RoundedRectangle(cornerRadius: 10))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 24)
+                }
+            }
+            .padding(.vertical, 20)
         }
-        .frame(maxWidth: .infinity)
     }
-    
+
+    // MARK: - Demos
+    // Lists .dem files under id1/ and id1/demos/ and launches playback
+    // through `playdemo <name>`.
+
+    var demosView: some View {
+        let count = Int(MQBridge_GetDemoCount())
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    Text("Demos").font(.system(size: 16, weight: .bold, design: .monospaced))
+                    Spacer()
+                    Button {
+                        MQBridge_ConsoleCommand("record auto")
+                    } label: {
+                        Label("Record Here", systemImage: "record.circle.fill")
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .help("Requires an active map. Writes to id1/auto.dem.")
+                }
+                .padding(.horizontal, 24)
+
+                if count == 0 {
+                    Text("No demos found. Classic demo files ship in pak0.pak (demo1/2/3) and play automatically on startup.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .padding(24)
+                } else {
+                    LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 12) {
+                        ForEach(0..<count, id: \.self) { i in
+                            let name = String(cString: MQBridge_GetDemoName(Int32(i)))
+                            Button {
+                                MQBridge_PlayDemo(name)
+                            } label: {
+                                HStack {
+                                    Image(systemName: "film").foregroundColor(.blue)
+                                    Text(name).font(.system(size: 14, weight: .semibold, design: .monospaced))
+                                    Spacer()
+                                    Image(systemName: "play.fill").foregroundStyle(.tertiary)
+                                }
+                                .padding(10)
+                                .background(.ultraThinMaterial)
+                                .clipShape(RoundedRectangle(cornerRadius: 10))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 24)
+                }
+            }
+            .padding(.vertical, 20)
+        }
+    }
+
+    // MARK: - Multiplayer
+    // LAN server browser backed by Quake's native hostcache. "Scan LAN"
+    // fires the `slist` console command which broadcasts a query over
+    // UDP; responses arrive async and populate hostcache[]. We re-read
+    // the list each time the view refreshes so new entries appear.
+
+    @State private var lastScanTick: Int = 0
+
+    var multiplayerView: some View {
+        let count = Int(MQBridge_GetServerCount())
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    Text("LAN Servers").font(.system(size: 16, weight: .bold, design: .monospaced))
+                    Spacer()
+                    Button {
+                        MQBridge_ScanLAN()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                            lastScanTick += 1
+                        }
+                    } label: {
+                        Label("Scan LAN", systemImage: "wifi.circle")
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.blue)
+
+                    // SharePlay activation. Only meaningful inside an
+                    // active FaceTime call; prepareForActivation gracefully
+                    // reports "activationDisabled" otherwise.
+                    if #available(macOS 13.0, *) {
+                        Button {
+                            let map = String(cString: MQBridge_GetCurrentMap())
+                            let name = map.isEmpty ? "start" : map
+                            MQSharePlayManager.shared.startSession(serverAddress: "127.0.0.1:27500", mapName: name)
+                        } label: {
+                            Label("SharePlay", systemImage: "person.2.wave.2")
+                                .font(.system(size: 12, weight: .semibold))
+                        }
+                        .buttonStyle(.bordered)
+                        .help("Invite FaceTime participants to join the current session")
+                    }
+                }
+                .padding(.horizontal, 24)
+
+                HStack(spacing: 8) {
+                    TextField("host:port", text: $directConnectHost)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 240)
+                    Button("Connect") {
+                        if !directConnectHost.isEmpty {
+                            MQBridge_ConsoleCommand("connect \(directConnectHost)")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .padding(.horizontal, 24)
+
+                if count == 0 {
+                    Text("No servers found. Tap Scan LAN to broadcast a query on your local network, or paste an address above to direct-connect.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .padding(24)
+                } else {
+                    ForEach(0..<count, id: \.self) { i in
+                        let name = String(cString: MQBridge_GetServerName(Int32(i)))
+                        let addr = String(cString: MQBridge_GetServerAddress(Int32(i)))
+                        Button {
+                            MQBridge_ConnectServer(Int32(i))
+                        } label: {
+                            HStack {
+                                Image(systemName: "network").foregroundColor(.green)
+                                VStack(alignment: .leading) {
+                                    Text(name.isEmpty ? addr : name)
+                                        .font(.system(size: 14, weight: .semibold))
+                                    if !name.isEmpty {
+                                        Text(addr).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
+                                    }
+                                }
+                                Spacer()
+                                Image(systemName: "arrow.right.circle.fill").foregroundColor(.orange)
+                            }
+                            .padding(12)
+                            .background(.ultraThinMaterial)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 24)
+                    }
+                }
+            }
+            .padding(.vertical, 20)
+            .id(lastScanTick) // re-evaluate when scan completes
+        }
+    }
+
     // MARK: - About
     
     var aboutView: some View {
@@ -391,12 +748,13 @@ struct MetalQuakeLauncherView: View {
                 
                 VStack(alignment: .leading, spacing: 12) {
                     AboutRow(label: "Pipeline", value: "Metal 4 + Hardware Ray Tracing")
-                    AboutRow(label: "Threading", value: "GCD dispatch_apply (12 P-cores)")
-                    AboutRow(label: "Upscaling", value: "MetalFX Spatial Scaler 2×")
-                    AboutRow(label: "Input", value: "GameController.framework + Adaptive Triggers")
-                    AboutRow(label: "Audio", value: "Core Audio (PHASE scaffolded)")
+                    AboutRow(label: "Threading", value: "GCD dispatch_apply across P-cores")
+                    AboutRow(label: "Upscaling", value: "MetalFX Spatial + Temporal (user-configurable)")
+                    AboutRow(label: "Input", value: "GameController + DualSense Adaptive Triggers + Gyro")
+                    AboutRow(label: "Audio", value: "Core Audio mixer + PHASE spatial engine with BSP occluder")
+                    AboutRow(label: "Denoise", value: "Bilateral à-trous with SVGF temporal reprojection opt-in")
                     AboutRow(label: "UI", value: "SwiftUI + Liquid Glass")
-                    AboutRow(label: "Platform", value: "Apple Silicon Native")
+                    AboutRow(label: "Platform", value: "Apple Silicon Native (arm64, macOS 14+)")
                 }
                 .padding(24)
                 .background(.ultraThinMaterial)
@@ -424,9 +782,42 @@ struct MetalQuakeLauncherView: View {
     }
     
     func applyAndResume() {
-        // Sync all settings from UserDefaults → MetalQuakeSettings → engine cvars
+        // Sync all settings from UserDefaults → MetalQuakeSettings → engine
+        // cvars, then persist to disk so a crash or force-quit doesn't lose
+        // the user's choices. The bridge function calls MQ_SaveSettings()
+        // internally now.
         MQBridge_SyncSettings()
+        MQBridge_SaveSettingsToDisk()
         MQBridge_SetLauncherVisible(0)
+    }
+
+    func resetDefaults() {
+        // Mirrors MQ_InitSettings' defaults on the Swift side so the
+        // sliders snap back without going through the engine. Next Apply
+        // will sync the reset values back through to cvars / disk.
+        settings.rtEnabled           = true
+        settings.rtQuality           = 2
+        settings.metalfxMode         = 1
+        settings.metalfxScale        = 2.0
+        settings.neuralDenoise       = false
+        settings.meshShaders         = false
+        settings.liquidGlassUI       = false
+        settings.audioMode           = 0
+        settings.spatialAudio        = false
+        settings.masterVolume        = 0.7
+        settings.volumeMusic         = 0.5
+        settings.mouseSensitivity    = 3.0
+        settings.autoAim             = true
+        settings.invertY             = false
+        settings.rawMouse            = true
+        settings.controllerDeadzone  = 0.15
+        settings.hapticIntensity     = 1.0
+        settings.fov                 = 90.0
+        settings.gamma               = 1.0
+        settings.hudScale            = 1.0
+        settings.coremlTextures      = false
+        settings.highContrastHUD     = false
+        settings.subtitles           = false
     }
 }
 

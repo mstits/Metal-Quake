@@ -19,6 +19,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 */
 
 #include "quakedef.h"
+#include "Metal_Settings.h"
 
 extern cvar_t pausable;
 
@@ -863,6 +864,59 @@ void Host_Version_f(void) {
              "\n");
 }
 
+// `mq_info` — dump the Metal Quake feature state. Resolves settings,
+// detected GPU family, enabled renderer paths, and net driver info.
+// Useful for bug reports and when diagnosing config drift.
+extern const char* MQBridge_GetCurrentMap(void);
+extern float       MQBridge_GetFPS(void);
+extern int         MQ_HighFreqMouse_GetRate(void);
+
+void Host_MetalQuakeInfo_f(void) {
+  extern MetalQuakeSettings* MQ_GetSettings(void);
+  MetalQuakeSettings *s = MQ_GetSettings();
+  extern cvar_t vid_rtx;
+
+  // r_svgf, r_frameinterp, joy_gyro_enabled are module-static cvars —
+  // fetched by name through the cvar subsystem instead of by symbol.
+  cvar_t *svgf   = Cvar_FindVar("r_svgf");
+  cvar_t *finterp = Cvar_FindVar("r_frameinterp");
+  cvar_t *gyro   = Cvar_FindVar("joy_gyro_enabled");
+
+  Con_Printf("-- Metal Quake --\n");
+  Con_Printf("  map        : %s\n", MQBridge_GetCurrentMap());
+  Con_Printf("  fps        : %.0f\n", MQBridge_GetFPS());
+  Con_Printf("  mouse poll : %d Hz (hardware-dependent)\n", MQ_HighFreqMouse_GetRate());
+  Con_Printf("  vid_rtx    : %s\n", vid_rtx.value ? "on" : "off");
+  Con_Printf("  rt_quality : %d\n", s->rt_quality);
+  Con_Printf("  metalfx    : mode=%d scale=%.2f\n", s->metalfx_mode, s->metalfx_scale);
+  if (svgf) {
+    Con_Printf("  r_svgf     : %s\n", svgf->value >= 2.0f ? "variance-guided" :
+                                      svgf->value >= 1.0f ? "reprojection"    : "off");
+  }
+  if (finterp) Con_Printf("  frame interp: %s\n", finterp->value ? "on" : "off");
+  if (gyro)    Con_Printf("  gyro aim   : %s\n", gyro->value ? "on" : "off");
+  Con_Printf("  denoise    : %s\n", s->neural_denoise ? "bilateral atrous" : "off");
+  Con_Printf("  fov        : %.1f\n", s->fov);
+  Con_Printf("  gamma      : %.2f\n", s->gamma);
+  Con_Printf("  sensitivity: %.2f\n", s->mouse_sensitivity);
+  Con_Printf("  subtitles  : %s\n", s->subtitles ? "on" : "off");
+  Con_Printf("  hud_scale  : %.2f (viewsize=%.0f)\n", s->hud_scale, 120.0f - (s->hud_scale - 1.0f) * 20.0f);
+  Con_Printf("  config     : id1/metal_quake.cfg\n");
+}
+
+// `dumpcvars` — list every registered cvar and its current value. Handy
+// when diagnosing config drift between the launcher @AppStorage and the
+// in-engine state.
+extern cvar_t *cvar_vars;
+void Host_DumpCvars_f(void) {
+  int count = 0;
+  for (cvar_t *v = cvar_vars; v; v = v->next) {
+    Con_Printf("%-24s %s\n", v->name, v->string);
+    count++;
+  }
+  Con_Printf("(%d cvars)\n", count);
+}
+
 #ifdef IDGODS
 void Host_Please_f(void) {
   client_t *cl;
@@ -1696,6 +1750,8 @@ void Host_InitCommands(void) {
   Cmd_AddCommand("name", Host_Name_f);
   Cmd_AddCommand("noclip", Host_Noclip_f);
   Cmd_AddCommand("version", Host_Version_f);
+  Cmd_AddCommand("mq_info", Host_MetalQuakeInfo_f);
+  Cmd_AddCommand("dumpcvars", Host_DumpCvars_f);
 #ifdef IDGODS
   Cmd_AddCommand("please", Host_Please_f);
 #endif

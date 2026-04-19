@@ -12,16 +12,72 @@
   ],
   "layers" : [
     {
+      "pad_r" : 0,
+      "fused_relu" : 0,
+      "fused_tanh" : 0,
+      "debug_info" : "denoiseConv1",
+      "pad_fill_mode" : 0,
+      "pad_b" : 0,
+      "pad_l" : 0,
+      "top" : "d1",
+      "blob_weights" : 1,
+      "K" : 3,
+      "name" : "denoiseConv1",
+      "has_batch_norm" : 0,
+      "type" : "convolution",
+      "n_groups" : 3,
+      "pad_t" : 0,
+      "has_biases" : 0,
+      "C" : 3,
       "bottom" : "input",
-      "beta" : 0,
+      "weights" : {
+
+      },
+      "Nx" : 3,
+      "pad_mode" : 1,
+      "pad_value" : 0,
+      "Ny" : 3,
+      "n_parallel" : 1
+    },
+    {
+      "alpha" : 0.5,
+      "bottom" : "input",
       "weights" : {
 
       },
       "mode" : 6,
-      "debug_info" : "identity",
-      "top" : "output",
+      "debug_info" : "inHalf",
+      "top" : "inHalf",
       "type" : "activation",
-      "name" : "identity",
+      "name" : "inHalf",
+      "beta" : 0
+    },
+    {
+      "alpha" : 0.5,
+      "bottom" : "d1",
+      "weights" : {
+
+      },
+      "mode" : 6,
+      "debug_info" : "d1Half",
+      "top" : "d1Half",
+      "type" : "activation",
+      "name" : "d1Half",
+      "beta" : 0
+    },
+    {
+      "bottom" : "inHalf,d1Half",
+      "alpha" : 1,
+      "operation" : 0,
+      "beta" : 0,
+      "weights" : {
+
+      },
+      "fused_relu" : 0,
+      "debug_info" : "residual",
+      "top" : "output",
+      "type" : "elementwise",
+      "name" : "residual",
       "attributes" : {
         "is_output" : 1
       }

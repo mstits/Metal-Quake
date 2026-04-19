@@ -36,6 +36,7 @@ cvar_t		scr_conspeed = {"scr_conspeed","300"};
 cvar_t		scr_centertime = {"scr_centertime","2"};
 cvar_t		scr_showram = {"showram","1"};
 cvar_t		scr_showturtle = {"showturtle","0"};
+cvar_t		scr_showfps = {"showfps","0", true}; // archived across sessions
 cvar_t		scr_showpause = {"showpause","1"};
 cvar_t		scr_printspeed = {"scr_printspeed","8"};
 
@@ -318,6 +319,7 @@ void SCR_Init (void)
 	Cvar_RegisterVariable (&scr_conspeed);
 	Cvar_RegisterVariable (&scr_showram);
 	Cvar_RegisterVariable (&scr_showturtle);
+	Cvar_RegisterVariable (&scr_showfps);
 	Cvar_RegisterVariable (&scr_showpause);
 	Cvar_RegisterVariable (&scr_centertime);
 	Cvar_RegisterVariable (&scr_printspeed);
@@ -362,7 +364,7 @@ SCR_DrawTurtle
 void SCR_DrawTurtle (void)
 {
 	static int	count;
-	
+
 	if (!scr_showturtle.value)
 		return;
 
@@ -377,6 +379,38 @@ void SCR_DrawTurtle (void)
 		return;
 
 	Draw_Pic (scr_vrect.x, scr_vrect.y, scr_turtle);
+}
+
+/*
+==============
+SCR_DrawFPS — top-right corner FPS counter, gated by `showfps`.
+Smooths over a 0.25s window so the number is readable instead of
+flickering every frame.
+==============
+*/
+void SCR_DrawFPS (void)
+{
+	static double lastCalc = 0;
+	static double lastFPS  = 60.0;
+	static int    frames   = 0;
+
+	if (!scr_showfps.value)
+		return;
+
+	frames++;
+	if (realtime - lastCalc >= 0.25) {
+		lastFPS  = frames / (realtime - lastCalc);
+		lastCalc = realtime;
+		frames   = 0;
+	}
+
+	char buf[16];
+	snprintf(buf, sizeof(buf), "%.0f fps", lastFPS);
+	// Top-right corner with 4px padding. vid.width gets scaled by the
+	// compositor so using the virtual 320 logical width keeps the
+	// overlay anchored to the top-right regardless of display size.
+	int len = (int)strlen(buf);
+	Draw_String (vid.width - len * 8 - 4, 4, buf);
 }
 
 /*
@@ -926,6 +960,7 @@ void SCR_UpdateScreen (void)
 		SCR_DrawRam ();
 		SCR_DrawNet ();
 		SCR_DrawTurtle ();
+		SCR_DrawFPS ();
 		SCR_DrawPause ();
 		SCR_CheckDrawCenterString ();
 		Sbar_Draw ();

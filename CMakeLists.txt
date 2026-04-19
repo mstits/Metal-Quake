@@ -88,9 +88,16 @@ set(MACOS_SOURCES
     src/core/net_macos.c
     src/core/cd_null.c
     src/macos/vid_metal.cpp
+    src/macos/Metal_Renderer_Main.cpp
+    src/macos/Sys_Tahoe_Input.mm
     src/macos/snd_coreaudio.cpp
     src/macos/in_gamecontroller.mm
     src/macos/net_apple.cpp
+    src/macos/GCD_Tasks.m
+    src/macos/MetalQuakeBridge.m
+    src/macos/MQ_PHASE_Audio.m
+    src/macos/MQ_CoreML.m
+    src/macos/MQ_Ecosystem.m
 )
 
 add_executable(quake_metal ${COMMON_SOURCES} ${MACOS_SOURCES})
@@ -113,10 +120,23 @@ target_link_libraries(quake_metal PRIVATE
     "-framework GameController"
     "-framework CoreHaptics"
     "-framework Network"
+    "-framework MetalPerformanceShaders"
+    "-framework MetalPerformanceShadersGraph"
+    "-framework Accelerate"
+    "-framework AVFoundation"
+    "-framework CoreMedia"
+    "-framework CoreVideo"
+    "-framework ModelIO"
+    "-framework CoreML"
+    "-framework GameKit"
+    "-framework NaturalLanguage"
 )
 
-# MetalFX is only available on macOS 13.0+
-target_link_options(quake_metal PRIVATE "-Wl,-weak_framework,MetalFX")
+# Weak-linked frameworks (not on every supported macOS version)
+target_link_options(quake_metal PRIVATE
+    "-Wl,-weak_framework,MetalFX"
+    "-Wl,-weak_framework,PHASE"
+)
 
 # Build settings
 set_target_properties(quake_metal PROPERTIES

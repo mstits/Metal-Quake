@@ -23,7 +23,7 @@ static AudioUnit outputUnit;
 // ---------------------------------------------------------------------------
 class CircleBuffer {
 public:
-    CircleBuffer() : buffer(nullptr), sizeFrames(0), head(0), tail(0) {}
+    CircleBuffer() : buffer(nullptr), sizeFrames(0), head(0), tail(0), framesConsumed(0) {}
     ~CircleBuffer() { if (buffer) free(buffer); }
 
     void Init(uint32_t totalFrames) {
@@ -33,12 +33,15 @@ public:
         memset(buffer, 0, sizeFrames * 2 * sizeof(int16_t));
         head.store(0);
         tail.store(0);
+        framesConsumed.store(0);
     }
 
-    // Called by Core Audio (pulls data)
+    // Called by Core Audio (pulls data). framesConsumed is a monotonic
+    // counter of frames the speaker has played, used by Quake's paintedtime
+    // scheduling via SNDDMA_GetDMAPos — not by any in-buffer math here.
     uint32_t Read(float* left, float* right, uint32_t frames) {
         uint32_t framesRead = 0;
-        uint32_t currentHead = head.load(std::memory_order_acquire);
+        uint32_t currentHead = head.load(std::memory_order_relaxed);
         uint32_t currentTail = tail.load(std::memory_order_acquire);
 
         uint32_t available;
@@ -57,12 +60,14 @@ public:
             framesRead++;
         }
         head.store(currentHead, std::memory_order_release);
+        framesConsumed.fetch_add(framesRead, std::memory_order_release);
         return framesRead;
     }
 
-    // Called by Quake (pushes data)
+    // Called by Quake (pushes data). tail is only written here, and is the
+    // single release edge the reader observes with memory_order_acquire.
     void Write(const int16_t* src, uint32_t frames) {
-        uint32_t currentTail = tail.load(std::memory_order_acquire);
+        uint32_t currentTail = tail.load(std::memory_order_relaxed);
         for (uint32_t i = 0; i < frames; i++) {
             buffer[currentTail * 2]     = src[i * 2];
             buffer[currentTail * 2 + 1] = src[i * 2 + 1];
@@ -73,6 +78,7 @@ public:
 
     uint32_t GetHead() const { return head.load(std::memory_order_relaxed); }
     uint32_t GetTail() const { return tail.load(std::memory_order_relaxed); }
+    uint64_t GetFramesConsumed() const { return framesConsumed.load(std::memory_order_acquire); }
     uint32_t GetSizeFrames() const { return sizeFrames; }
 
 private:
@@ -80,6 +86,7 @@ private:
     uint32_t sizeFrames;
     std::atomic<uint32_t> head;
     std::atomic<uint32_t> tail;
+    std::atomic<uint64_t> framesConsumed; // monotonic frames played by Core Audio
 };
 
 static CircleBuffer g_audioBuffer;
@@ -118,7 +125,32 @@ extern "C" qboolean SNDDMA_Init(void) {
 
     shm = &sn;
 
-    sn.speed      = 44100;
+    // Prefer the default output device's native sample rate so the
+    // OS doesn't have to resample on every callback. Falls back to
+    // 44100 if the query fails (unlikely on modern macOS but cheap).
+    Float64 nativeRate = 44100.0;
+    {
+        AudioObjectPropertyAddress defOutAddr = {
+            kAudioHardwarePropertyDefaultOutputDevice,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        AudioDeviceID devId = 0;
+        UInt32 size = sizeof(devId);
+        if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &defOutAddr, 0, nullptr, &size, &devId) == noErr && devId != 0) {
+            AudioObjectPropertyAddress rateAddr = {
+                kAudioDevicePropertyNominalSampleRate,
+                kAudioObjectPropertyScopeOutput,
+                kAudioObjectPropertyElementMain
+            };
+            Float64 rate = 0.0;
+            size = sizeof(rate);
+            if (AudioObjectGetPropertyData(devId, &rateAddr, 0, nullptr, &size, &rate) == noErr && rate > 0.0) {
+                nativeRate = rate;
+            }
+        }
+    }
+    sn.speed      = (int)nativeRate;
     sn.channels   = 2;
     sn.samplebits = 16;
     
@@ -145,7 +177,8 @@ extern "C" qboolean SNDDMA_Init(void) {
     }
 
     AudioStreamBasicDescription format;
-    format.mSampleRate       = sn.speed;
+    memset(&format, 0, sizeof(format));
+    format.mSampleRate       = (Float64)sn.speed;
     format.mFormatID         = kAudioFormatLinearPCM;
     format.mFormatFlags      = kAudioFormatFlagIsFloat | kAudioFormatFlagIsNonInterleaved | kAudioFormatFlagIsPacked;
     format.mFramesPerPacket  = 1;
@@ -177,8 +210,16 @@ extern "C" qboolean SNDDMA_Init(void) {
 }
 
 extern "C" int SNDDMA_GetDMAPos(void) {
-    // Current play position in mono samples (interleaved)
-    return (g_audioBuffer.GetHead() * 2) % sn.samples;
+    // Quake's mixer expects GetDMAPos() to return the play cursor inside
+    // *its own* DMA buffer (sn.buffer, sn.samples mono samples). The proxy
+    // ring buffer we own is a separate allocation of a different size, so
+    // head/tail inside that ring are not a valid position in sn.buffer.
+    //
+    // Instead, track monotonic frames consumed by Core Audio and project
+    // back into sn.samples as mono samples: played_frames * channels mod
+    // sn.samples. That matches what the original DMA driver reported.
+    uint64_t consumed = g_audioBuffer.GetFramesConsumed();
+    return (int)((consumed * 2) % (uint64_t)sn.samples);
 }
 
 extern "C" void SNDDMA_Shutdown(void) {

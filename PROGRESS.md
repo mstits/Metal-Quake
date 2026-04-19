@@ -1,9 +1,62 @@
 # Engineering Progress Report: Quake Apple Silicon Modernization
 
-## Session Status: v1.2.0 — PostFX Pipeline Complete
+## Session Status: v1.4.0 — Research Backlog Landed
+
+**Date:** April 19, 2026
+**Current State:** Every item that 1.3.0 left as "In Motion" or "deferred" is now landed. The four biggest holdovers — SVGF variance-guided denoise, MetalFX Frame Interpolation, BLAS split, ReSTIR DI — are fully wired, and the RT dispatch is now built around a single argument buffer + function-constant-specialized PostFX pipeline. The CoreML ANE path loads a real compiled `MLModel`.
+
+### Pipeline at a glance
+
+```mermaid
+flowchart LR
+    SW[Software renderer<br/>320×240 chromakey] --> COMP[Compositor<br/>function-const PostFX]
+    RT[RT compute<br/>IAS + arg buffer] --> RESTIR[ReSTIR DI<br/>reservoir select]
+    RESTIR --> SVGF[SVGF reproject + variance]
+    SVGF --> DENOISE[Bilateral à-trous<br/>2 passes]
+    DENOISE --> COMP
+    COMP --> UP[MetalFX<br/>Spatial / Temporal]
+    UP --> FI[Frame Interp<br/>r_frameinterp]
+    FI --> DISPLAY[Drawable]
+```
+
+### v1.4.0 additions
+
+- **SVGF variance-guided path** — separate `svgfVariance` compute kernel feeding RG16F moments + R16F variance. `r_svgf 2` enables full variance modulation of the bilateral stop function; `r_svgf 1` keeps the reprojection-only path.
+- **MetalFX Frame Interpolation** end-to-end via `MQ_FrameInterp.m` (ObjC shim importing `<MetalFX/MetalFX.h>` since the vendored metal-cpp doesn't carry the header). Creates `MTLFXFrameInterpolator`, encodes the synthesized middle frame, blits into a prev-frame history. Gated behind `r_frameinterp`.
+- **Split world/entity BLAS** behind `r_rt_split_blas`. World BLAS cached per-map, entity BLAS refit per-frame, both wrapped in a 2-instance IAS. Single-BLAS path is now just a 1-instance IAS — shader stays single-path with an `instanceOffsets` buffer.
+- **ReSTIR DI** behind `r_restir`. CPU-side emissive-triangle list (built by 8×8 grid-sampling the atlas per triangle for any texel in the emissive palette range), 4-candidate weighted reservoir per pixel.
+- **Argument buffers** — 6 device pointers (skins, entities, motion vectors, emissive list, reservoirs, instance offsets) packed into a single `MTLArgumentEncoder`-populated buffer at slot 5, with `useResource:` annotations so the ray kernel sees them as resident.
+- **PostFX function constants** — 5 `MTLFunctionConstantValues` compile disabled stages out instead of runtime-branching.
+- **CoreML `MLModel` load path** — `MQ_Denoiser.mlmodelc` / `MQ_RealESRGAN.mlmodelc` load with `MLComputeUnitsAll`, run on the ANE when input shape is 320×240. `scripts/create_coreml_models.py` bakes deterministic conv-network weights as the default; trained Real-ESRGAN checkpoints drop in place.
+- **MTLResidencySet** (macOS 15+) via `MQ_Residency.m` — atlas + meshlet buffers pinned as resident across frames.
+- **Modifier-key routing**: `NSEventTypeFlagsChanged` handler restores Shift/Ctrl/Option transitions so `_`, `~`, and modifier binds fire correctly.
+- **View-section launcher sliders**: FOV / gamma / HUD scale exposed and hot-applied.
+- **`mq_info` / `dumpcvars` console commands**.
+- **`showfps` overlay** with 0.25s smoothing.
+- **Underwater volumetric fog** + **RT water refraction** (Snell + Fresnel Schlick).
+- **Test harness** (`tests/run.sh`) — settings round-trip and UDP address-compare tests; the first caught a real `fscanf` bug in the settings loader.
+
+## v1.3.0 — Honesty + Depth Pass
+
+**Date:** April 19, 2026
+**Current State:** Previous "Shipped" claims in the README that were actually dead code or scaffolding have been either made real or reclassified as In Motion. The engine compiles and runs the same as 1.2.0, with these concrete additions:
+
+- **GPU Gaussian denoiser**. The prior `MPSGraph` pipeline was dead code — its executables were never compiled, so every call early-returned `-1` and the bilateral à-trous ran alone. Replaced with `MPSImageGaussianBlur` consuming and producing `MTLTexture` directly — no CPU round-trip, no per-frame `malloc/free`, no pixel loops.
+- **Settings persistence**. `MQ_SaveSettings`/`MQ_LoadSettings` are now called from `sys_macos.m` at Host_Init / shutdown, and cover all 28 struct fields instead of the prior 16. Forward-compatible on load (unknown keys skipped).
+- **PHASE BSP occluder**. Walks `cl.worldmodel->surfaces`, fan-triangulates every non-sky/non-liquid face into an `MDLMesh`, and attaches a `PHASEOccluder` so sound geometry actually matches world geometry. Listener environment also drives a distance-model swap (water/slime/lava/air) so submerged sounds attenuate faster.
+- **Network driver**. `StartReceiving` now extracts the remote endpoint into a `qsockaddr` so the engine can tell peers apart. `UDP_CheckNewConnections` dequeues from a pending-connection ring fed by the `nw_listener` callback. `UDP_OpenSocket` binds a local port instead of returning a virtual ID.
+- **Controller polish**. Weapon-switch edge reprograms DualSense adaptive-trigger profile; gyro aim integrated when a motion sensor is present (`joy_gyro_*` cvars); battery-level warnings throttled to once per minute.
+- **Core Audio ring buffer**. Added monotonic `framesConsumed` so `SNDDMA_GetDMAPos` reports the DMA buffer's play cursor in the right units; prior code returned the proxy ring buffer's head, which has a different size than `sn.samples`.
+- **Per-event autoreleasepool** around the macOS event pump — input-heavy frames no longer accumulate autorelease objects until `Host_Frame`.
+- **Mesh-shader LOD** gated on `lodNearDistance`/`lodFarDistance` uniforms — meshlets beyond the near threshold emit every *k*-th triangle, capped at 4× reduction.
+- **SVGF scaffolding**. History texture + temporal-reprojection compute kernel, gated by `r_svgf` cvar. Variance-aware weights are the remaining SVGF half.
+- **MetalFX Frame Interpolation** availability detection via `objc_getClass("MTLFXFrameInterpolator")`; `r_frameinterp` cvar registered. Full encode wiring pending (vendored metal-cpp lacks the header; runtime path works).
+- **Cleanups**. `_blasEvent` no longer leaks on every process launch; per-frame vertex/index buffers grow-and-reuse instead of `release()` + `newBuffer()` churn; `Info.plist` carries full version metadata; `build.sh` applies `-fobjc-arc` to `.m` files (previously only `.mm`); `CMakeLists.txt` sources synced with `build.sh`.
+
+## v1.2.0 — PostFX Pipeline Complete
 
 **Date:** April 2, 2026
-**Current State:** **Production-Ready.** Full 12-stage GPU post-processing pipeline, MetalFX spatial + temporal upscaling, SSAO, EDR/HDR, CoreML ANE inference, and 12-item in-game settings menu. Legacy platform code (3dfx, OpenGL, DOS, X11) removed. Engine runs at 120+ fps with all effects active on Apple Silicon.
+**State:** Full 12-stage GPU post-processing pipeline, MetalFX spatial + temporal upscaling, SSAO, EDR/HDR, CoreML ANE inference (see note above), and 12-item in-game settings menu. Legacy platform code (3dfx, OpenGL, DOS, X11) removed. Engine runs at 120+ fps with all effects active on Apple Silicon.
 
 ## Major Architectural Updates
 

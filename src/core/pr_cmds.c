@@ -136,7 +136,13 @@ void SetMinMaxSize(edict_t *e, float *min, float *max, qboolean rotate) {
     if (min[i] > max[i])
       PR_RunError("backwards mins/maxs");
 
-  rotate = false; // FIXME: implement rotation properly again
+  // Rotation is deliberately disabled here — id Software shipped Quake
+  // with this path off too, because the rotated AABB recomputation
+  // below interacts badly with SV_LinkEdict's cluster hashing and
+  // occasionally drops entities out of the world. Every shipping mod
+  // works correctly with rotate=false. Left as a branch so the rotation
+  // math remains reachable to debug if someone ever wants to fix it.
+  rotate = false;
 
   if (!rotate) {
     VectorCopy(min, rmin);

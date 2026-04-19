@@ -59,8 +59,28 @@ const char* MQBridge_GetCurrentMap(void) {
 }
 
 float MQBridge_GetFPS(void) {
+    // Cache the last valid FPS reading so the launcher doesn't flash 0
+    // between frames (host_frametime is zero on the first frame and for
+    // any tick where Host_Frame early-exited).
     extern double host_frametime;
-    return (host_frametime > 0.0) ? (float)(1.0 / host_frametime) : 0.0f;
+    static float lastFPS = 60.0f;
+    if (host_frametime > 0.0) {
+        lastFPS = (float)(1.0 / host_frametime);
+    }
+    return lastFPS;
+}
+
+void MQBridge_SaveSettingsToDisk(void) {
+    extern void MQ_SaveSettings(const char* path);
+    MQ_SaveSettings("id1/metal_quake.cfg");
+}
+
+// Simple accessibility getters exposed as plain C so legacy engine files
+// like snd_dma.c can query them without pulling in Metal_Settings.h and
+// the whole Objective-C/C++ header chain.
+int MQ_Subtitles_Enabled(void) {
+    MetalQuakeSettings *s = MQ_GetSettings();
+    return (s && s->subtitles) ? 1 : 0;
 }
 
 void MQBridge_SetLauncherVisible(int visible) {
@@ -134,26 +154,43 @@ void MQBridge_ApplySettings(MetalQuakeSettings settings) {
 
 static NSArray<NSString*>* _cachedMaps = nil;
 
+// Best-effort map discovery. We scan id1/maps (plus -game override dirs
+// if present) for .bsp files on the filesystem. Quake's PAK files can
+// also carry maps, but the pak loader is C-level and exposing its
+// directory requires poking at pak_t internals — filesystem maps cover
+// the mod case, which is why this used to be hardcoded.
 static void _discoverMaps(void) {
     if (_cachedMaps) return;
-    
-    // Known Quake episode maps
-    NSMutableArray* maps = [NSMutableArray array];
-    const char* knownMaps[] = {
-        "start", "e1m1", "e1m2", "e1m3", "e1m4", "e1m5", "e1m6", "e1m7", "e1m8",
-        "e2m1", "e2m2", "e2m3", "e2m4", "e2m5", "e2m6", "e2m7",
-        "e3m1", "e3m2", "e3m3", "e3m4", "e3m5", "e3m6", "e3m7",
-        "e4m1", "e4m2", "e4m3", "e4m4", "e4m5", "e4m6", "e4m7", "e4m8",
-        "dm1", "dm2", "dm3", "dm4", "dm5", "dm6",
-        "end",
-        NULL
-    };
-    
-    for (int i = 0; knownMaps[i]; i++) {
-        [maps addObject:[NSString stringWithUTF8String:knownMaps[i]]];
+
+    NSMutableSet<NSString*> *found = [NSMutableSet set];
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    NSArray<NSString*> *searchDirs = @[ @"id1/maps" ];
+    for (NSString *dir in searchDirs) {
+        NSArray<NSString*> *entries = [fm contentsOfDirectoryAtPath:dir error:nil];
+        for (NSString *e in entries) {
+            if ([[e pathExtension] caseInsensitiveCompare:@"bsp"] == NSOrderedSame) {
+                [found addObject:[e stringByDeletingPathExtension]];
+            }
+        }
     }
-    
-    _cachedMaps = [maps copy];
+
+    // Always include the standard episode maps — if the user runs with
+    // just pak0.pak and no extracted maps on disk, the filesystem scan
+    // returns nothing and the launcher would look empty.
+    NSArray<NSString*> *pakMaps = @[
+        @"start",
+        @"e1m1", @"e1m2", @"e1m3", @"e1m4", @"e1m5", @"e1m6", @"e1m7", @"e1m8",
+        @"e2m1", @"e2m2", @"e2m3", @"e2m4", @"e2m5", @"e2m6", @"e2m7",
+        @"e3m1", @"e3m2", @"e3m3", @"e3m4", @"e3m5", @"e3m6", @"e3m7",
+        @"e4m1", @"e4m2", @"e4m3", @"e4m4", @"e4m5", @"e4m6", @"e4m7", @"e4m8",
+        @"dm1", @"dm2", @"dm3", @"dm4", @"dm5", @"dm6",
+        @"end"
+    ];
+    for (NSString *m in pakMaps) [found addObject:m];
+
+    NSArray *sorted = [[found allObjects] sortedArrayUsingSelector:@selector(compare:)];
+    _cachedMaps = sorted;
 }
 
 int MQBridge_GetMapCount(void) {
@@ -186,13 +223,20 @@ void MQBridge_SyncSettings(void) {
     if ([d objectForKey:@"mq_audioMode"])       s->audio_mode       = (MQAudioMode)[d integerForKey:@"mq_audioMode"];
     if ([d objectForKey:@"mq_spatialAudio"])    s->spatial_audio    = [d boolForKey:@"mq_spatialAudio"] ? 1 : 0;
     if ([d objectForKey:@"mq_masterVolume"])    s->master_volume    = (float)[d doubleForKey:@"mq_masterVolume"];
-    
+    if ([d objectForKey:@"mq_volumeMusic"])     s->music_volume     = (float)[d doubleForKey:@"mq_volumeMusic"];
+
     // Input
     if ([d objectForKey:@"mq_mouseSensitivity"]) s->mouse_sensitivity = (float)[d doubleForKey:@"mq_mouseSensitivity"];
     if ([d objectForKey:@"mq_autoAim"])          s->auto_aim         = [d boolForKey:@"mq_autoAim"] ? 1 : 0;
     if ([d objectForKey:@"mq_invertY"])           s->invert_y         = [d boolForKey:@"mq_invertY"] ? 1 : 0;
     if ([d objectForKey:@"mq_rawMouse"])          s->raw_mouse        = [d boolForKey:@"mq_rawMouse"] ? 1 : 0;
     if ([d objectForKey:@"mq_controllerDeadzone"]) s->controller_deadzone = (float)[d doubleForKey:@"mq_controllerDeadzone"];
+    if ([d objectForKey:@"mq_hapticIntensity"]) s->haptic_intensity = (float)[d doubleForKey:@"mq_hapticIntensity"];
+
+    // View
+    if ([d objectForKey:@"mq_fov"])             s->fov              = (float)[d doubleForKey:@"mq_fov"];
+    if ([d objectForKey:@"mq_gamma"])           s->gamma            = (float)[d doubleForKey:@"mq_gamma"];
+    if ([d objectForKey:@"mq_hudScale"])        s->hud_scale        = (float)[d doubleForKey:@"mq_hudScale"];
     
     // Intelligence
     if ([d objectForKey:@"mq_coremlTextures"])  s->coreml_textures  = [d boolForKey:@"mq_coremlTextures"] ? 1 : 0;
@@ -218,6 +262,154 @@ void MQBridge_SyncSettings(void) {
     }
     if (s->invert_y) Cvar_SetValue((char*)"m_pitch", -0.022f);
     else Cvar_SetValue((char*)"m_pitch", 0.022f);
+}
+
+// ---- Save Slots ----
+
+// Quake's save files live in the gamedir (id1/ or a mod dir). The engine
+// uses `save <name>` and `load <name>` where <name> is the filename
+// stem; `save quick` writes `id1/quick.sav`. We enumerate those on demand
+// so newly-saved games appear without a launcher restart.
+static NSMutableArray<NSString*>* _saveSlots = nil;
+static NSMutableArray<NSNumber*>* _saveTimestamps = nil;
+
+static void _refreshSaveSlots(void) {
+    _saveSlots = [NSMutableArray array];
+    _saveTimestamps = [NSMutableArray array];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray<NSString*> *entries = [fm contentsOfDirectoryAtPath:@"id1" error:nil];
+    for (NSString *e in entries) {
+        if ([[e pathExtension] caseInsensitiveCompare:@"sav"] != NSOrderedSame) continue;
+        NSString *stem = [e stringByDeletingPathExtension];
+        [_saveSlots addObject:stem];
+        NSDictionary *attrs = [fm attributesOfItemAtPath:[@"id1" stringByAppendingPathComponent:e] error:nil];
+        NSDate *mod = attrs[NSFileModificationDate];
+        [_saveTimestamps addObject:@(mod ? [mod timeIntervalSince1970] : 0.0)];
+    }
+}
+
+int MQBridge_GetSaveSlotCount(void) {
+    _refreshSaveSlots();
+    return (int)_saveSlots.count;
+}
+
+const char* MQBridge_GetSaveSlotName(int index) {
+    if (!_saveSlots || index < 0 || index >= (int)_saveSlots.count) return "";
+    return [_saveSlots[index] UTF8String];
+}
+
+double MQBridge_GetSaveSlotTimestamp(int index) {
+    if (!_saveTimestamps || index < 0 || index >= (int)_saveTimestamps.count) return 0.0;
+    return [_saveTimestamps[index] doubleValue];
+}
+
+void MQBridge_LoadSaveSlot(int index) {
+    if (!_saveSlots || index < 0 || index >= (int)_saveSlots.count) return;
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "load %s\n", [_saveSlots[index] UTF8String]);
+    extern void Cbuf_AddText(char *text);
+    Cbuf_AddText(cmd);
+    _launcherVisible = 0;
+}
+
+void MQBridge_SaveCurrentGame(const char* slotName) {
+    if (!slotName || !slotName[0]) return;
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "save %s\n", slotName);
+    extern void Cbuf_AddText(char *text);
+    Cbuf_AddText(cmd);
+}
+
+// ---- Demos ----
+
+// Scan id1/ and id1/demos/ for .dem files and return the stem. Keep the
+// list across calls but refresh on each GetDemoCount call so recording a
+// new demo becomes visible on the next launcher tick.
+static NSMutableArray<NSString*>* _demoList = nil;
+
+static void _refreshDemos(void) {
+    _demoList = [NSMutableArray array];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray<NSString*> *roots = @[ @"id1", @"id1/demos" ];
+    for (NSString *dir in roots) {
+        NSArray<NSString*> *entries = [fm contentsOfDirectoryAtPath:dir error:nil];
+        for (NSString *e in entries) {
+            if ([[e pathExtension] caseInsensitiveCompare:@"dem"] == NSOrderedSame) {
+                [_demoList addObject:[e stringByDeletingPathExtension]];
+            }
+        }
+    }
+    [_demoList sortUsingSelector:@selector(compare:)];
+}
+
+int MQBridge_GetDemoCount(void) {
+    _refreshDemos();
+    return (int)_demoList.count;
+}
+
+const char* MQBridge_GetDemoName(int index) {
+    if (!_demoList || index < 0 || index >= (int)_demoList.count) return "";
+    return [_demoList[index] UTF8String];
+}
+
+void MQBridge_PlayDemo(const char* name) {
+    if (!name || !name[0]) return;
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "playdemo %s\n", name);
+    extern void Cbuf_AddText(char *text);
+    Cbuf_AddText(cmd);
+    _launcherVisible = 0;
+}
+
+// ---- Server Browser ----
+
+// Quake's netcode maintains `hostcache[]` — an array of servers seen via
+// slist/broadcast response. The `slist` console command triggers a LAN
+// broadcast; responses arrive async and repopulate the cache. We don't
+// re-implement the protocol here; we just poke `slist` and inspect the
+// resulting cache.
+
+// hostcache_t + hostcache[] + hostCacheCount are declared by net.h,
+// already included transitively via quakedef.h at the top of this file.
+
+void MQBridge_ScanLAN(void) {
+    extern void Cbuf_AddText(char *text);
+    // `slist` triggers the driver broadcast. Results populate over ~1s.
+    Cbuf_AddText("slist\n");
+    Con_Printf("LAN scan sent; responses populating…\n");
+}
+
+int MQBridge_GetServerCount(void) {
+    return hostCacheCount;
+}
+
+const char* MQBridge_GetServerAddress(int index) {
+    if (index < 0 || index >= hostCacheCount) return "";
+    return hostcache[index].cname;
+}
+
+const char* MQBridge_GetServerName(int index) {
+    if (index < 0 || index >= hostCacheCount) return "";
+    return hostcache[index].name;
+}
+
+// Toggle a boolean cvar (any non-zero value flips to 0; zero flips to 1).
+// Goes through Cvar_SetValue so the cvar subsystem's change hooks fire.
+void MQBridge_ToggleCvar(const char *name) {
+    if (!name || !name[0]) return;
+    cvar_t *v = Cvar_FindVar((char *)name);
+    if (!v) return;
+    extern void Cvar_SetValue(char *var_name, float value);
+    Cvar_SetValue((char *)name, v->value != 0.0f ? 0.0f : 1.0f);
+}
+
+void MQBridge_ConnectServer(int index) {
+    if (index < 0 || index >= hostCacheCount) return;
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "connect %s\n", hostcache[index].cname);
+    extern void Cbuf_AddText(char *text);
+    Cbuf_AddText(cmd);
+    _launcherVisible = 0;
 }
 
 // ---- MetalFX Spatial Upscaler ----
