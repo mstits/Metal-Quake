@@ -1,6 +1,42 @@
 # Engineering Progress Report: Quake Apple Silicon Modernization
 
-## Session Status: v1.3.0 — Honesty + Depth Pass
+## Session Status: v1.4.0 — Research Backlog Landed
+
+**Date:** April 19, 2026
+**Current State:** Every item that 1.3.0 left as "In Motion" or "deferred" is now landed. The four biggest holdovers — SVGF variance-guided denoise, MetalFX Frame Interpolation, BLAS split, ReSTIR DI — are fully wired, and the RT dispatch is now built around a single argument buffer + function-constant-specialized PostFX pipeline. The CoreML ANE path loads a real compiled `MLModel`.
+
+### Pipeline at a glance
+
+```mermaid
+flowchart LR
+    SW[Software renderer<br/>320×240 chromakey] --> COMP[Compositor<br/>function-const PostFX]
+    RT[RT compute<br/>IAS + arg buffer] --> RESTIR[ReSTIR DI<br/>reservoir select]
+    RESTIR --> SVGF[SVGF reproject + variance]
+    SVGF --> DENOISE[Bilateral à-trous<br/>2 passes]
+    DENOISE --> COMP
+    COMP --> UP[MetalFX<br/>Spatial / Temporal]
+    UP --> FI[Frame Interp<br/>r_frameinterp]
+    FI --> DISPLAY[Drawable]
+```
+
+### v1.4.0 additions
+
+- **SVGF variance-guided path** — separate `svgfVariance` compute kernel feeding RG16F moments + R16F variance. `r_svgf 2` enables full variance modulation of the bilateral stop function; `r_svgf 1` keeps the reprojection-only path.
+- **MetalFX Frame Interpolation** end-to-end via `MQ_FrameInterp.m` (ObjC shim importing `<MetalFX/MetalFX.h>` since the vendored metal-cpp doesn't carry the header). Creates `MTLFXFrameInterpolator`, encodes the synthesized middle frame, blits into a prev-frame history. Gated behind `r_frameinterp`.
+- **Split world/entity BLAS** behind `r_rt_split_blas`. World BLAS cached per-map, entity BLAS refit per-frame, both wrapped in a 2-instance IAS. Single-BLAS path is now just a 1-instance IAS — shader stays single-path with an `instanceOffsets` buffer.
+- **ReSTIR DI** behind `r_restir`. CPU-side emissive-triangle list (built by 8×8 grid-sampling the atlas per triangle for any texel in the emissive palette range), 4-candidate weighted reservoir per pixel.
+- **Argument buffers** — 6 device pointers (skins, entities, motion vectors, emissive list, reservoirs, instance offsets) packed into a single `MTLArgumentEncoder`-populated buffer at slot 5, with `useResource:` annotations so the ray kernel sees them as resident.
+- **PostFX function constants** — 5 `MTLFunctionConstantValues` compile disabled stages out instead of runtime-branching.
+- **CoreML `MLModel` load path** — `MQ_Denoiser.mlmodelc` / `MQ_RealESRGAN.mlmodelc` load with `MLComputeUnitsAll`, run on the ANE when input shape is 320×240. `scripts/create_coreml_models.py` bakes deterministic conv-network weights as the default; trained Real-ESRGAN checkpoints drop in place.
+- **MTLResidencySet** (macOS 15+) via `MQ_Residency.m` — atlas + meshlet buffers pinned as resident across frames.
+- **Modifier-key routing**: `NSEventTypeFlagsChanged` handler restores Shift/Ctrl/Option transitions so `_`, `~`, and modifier binds fire correctly.
+- **View-section launcher sliders**: FOV / gamma / HUD scale exposed and hot-applied.
+- **`mq_info` / `dumpcvars` console commands**.
+- **`showfps` overlay** with 0.25s smoothing.
+- **Underwater volumetric fog** + **RT water refraction** (Snell + Fresnel Schlick).
+- **Test harness** (`tests/run.sh`) — settings round-trip and UDP address-compare tests; the first caught a real `fscanf` bug in the settings loader.
+
+## v1.3.0 — Honesty + Depth Pass
 
 **Date:** April 19, 2026
 **Current State:** Previous "Shipped" claims in the README that were actually dead code or scaffolding have been either made real or reclassified as In Motion. The engine compiles and runs the same as 1.2.0, with these concrete additions:

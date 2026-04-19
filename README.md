@@ -47,13 +47,23 @@ Features are categorized honestly:
 | **Networking** | Network.framework | Shipped | UDP driver with NWConnection/NWListener, Multipath UDP, per-packet sender endpoint extraction, pending-connection queue for `UDP_CheckNewConnections` |
 | **UI** | SwiftUI | Shipped | NSPanel launcher overlay, full settings bridge to engine cvars |
 | **Settings Sync** | UserDefaults | Shipped | Cross-syncs `@AppStorage` values to engine variables; all 28 struct fields round-trip to `id1/metal_quake.cfg` on engine start/stop |
-| **Temporal Denoise** | Compute | In Motion | SVGF temporal-reprojection scaffolding behind `r_svgf` cvar; variance-aware weights are the remaining SVGF half |
-| **Frame Interpolation** | MetalFX | In Motion | `MTLFXFrameInterpolator` detection via ObjC runtime at startup; `r_frameinterp` cvar wired, full encode pass pending |
-| **GPU Denoising** | MPS / MPSGraph | Shipped | `MPSImageGaussianBlur` pre-pass + bilateral à-trous fallback (GPU-only, no CPU pixel round-trip) |
-| **Neural Upscaler** | MPSGraph (Metal 4) | In Motion | Bilinear 4× stand-in compiles and runs; trained Real-ESRGAN weight load is the remaining piece |
-| **Mesh Shaders** | Metal 3.1 | Shipped | High-poly BSP clustering (BSPMeshlets) with Object-Shader frustum culling and distance-based LOD |
-| **Shader Caching** | MTLBinaryArchive | Shipped | Zero-stutter implicit caching and serialization to disk |
-| **OS Integration** | Game Mode | Shipped | Bundled `.app` with Game Mode opt-in for doubled Bluetooth polling rates |
+| **SVGF Denoise** | Compute | Shipped | `r_svgf` cvar: mode 1 temporal reprojection, mode 2 full variance-guided (RG16F moments + R16F variance + dedicated `svgfVariance` kernel) |
+| **Frame Interpolation** | MetalFX | Shipped | Real `MTLFXFrameInterpolator` encode pass via `MQ_FrameInterp.m` ObjC shim; `r_frameinterp` cvar |
+| **BLAS Split** | Metal RT | Shipped | `r_rt_split_blas` cvar: world BLAS cached per map + entity BLAS per frame + 2-instance IAS with per-instance metadata offsets for correct TriTexInfo lookup |
+| **ReSTIR DI** | Compute | Shipped | `r_restir` cvar: CPU builds emissive-triangle list from 8×8 atlas-grid sampling; shader does 4-candidate weighted reservoir sampling with RIS normalization |
+| **Argument Buffers** | Metal | Shipped | 6 RT device pointers (vertices, indices, triTexInfos, dynLights, instanceOffsets, emissiveTris) wrapped in a single `MTLArgumentEncoder` buffer at slot 5 with per-resource `useResource:` annotation |
+| **PostFX Function Constants** | Metal | Shipped | 5 `[[function_constant]]` toggles (SSAO, CRT, Liquid Glass, chromatic aberration, high-contrast HUD) — infrastructure for pipeline-variant dead-code elimination |
+| **GPU Denoising** | MPS / MPSGraph | Shipped | Bilateral à-trous (primary) + MPSImageGaussianBlur (opt-in via `MQ_MPS_DENOISE=1` env) |
+| **CoreML Upscaler** | MLModel + ANE | Shipped | `MLModel.modelWithContentsOfURL:` loads `MQ_RealESRGAN.mlmodelc` and runs on ANE at 320×240 baked input; MPSGraph (bilinear + unsharp conv) fallback for other sizes |
+| **MetalFX Temporal** | MetalFX | Shipped | 640×480 → 1280×960 upscale with Halton(2,3) jitter + RT depth + motion vectors |
+| **MTLResidencySet** | Metal | Shipped | macOS 15+ pins atlas + meshlet buffers as resident via `MQ_Residency.m` shim |
+| **Mesh Shaders** | Metal 3.1 | Shipped | High-poly BSP clustering with Object-Shader frustum culling + distance-based LOD |
+| **BLAS Refit** | Metal RT | Shipped | `refitAccelerationStructure` on stable-topology frames (3-5× faster than rebuild) |
+| **Shader Caching** | MTLBinaryArchive | Shipped | Zero-stutter implicit caching; serialized to disk on `VID_Shutdown` |
+| **Crash Reporting** | MetricKit | Shipped | `MXMetricManager` subscriber writes JSON payloads to `~/Library/Application Support/MetalQuake/` |
+| **SharePlay** | GroupActivities | Shipped | `QuakeGroupActivity: GroupActivity` with `MQSharePlayManager` observer; auto-`connect` on incoming session joins |
+| **Game Center** | GameKit | Shipped | Authentication sheet presented on the game window; achievement + leaderboard submission on intermission |
+| **OS Integration** | Game Mode | Shipped | Bundled `.app` with `LSApplicationCategoryType` + `NSGameMode` for doubled Bluetooth polling + GPU priority |
 
 ---
 
@@ -74,47 +84,71 @@ Benchmarked on M4 Max, 640×480 internal RT resolution -> 1280x960 MetalFX displ
 
 ## Architecture
 
+Two renderers run side-by-side — the original 1996 software rasterizer
+for HUD / particles / sprites, and a Metal compute kernel that
+path-traces the world. A fragment shader composites them by chroma-key
+and runs the 12-stage PostFX pipeline.
+
 ```mermaid
-graph TB
-    subgraph "SwiftUI Shell"
-        Launcher["Launcher / Settings"]
+flowchart TB
+    subgraph Launcher[SwiftUI Launcher]
+        MQ[MQSettingsStore AppStorage]
     end
 
-    subgraph "Engine Core (C11, 1996)"
-        GameLoop["Host_Frame"]
-        Physics["SV_Physics"]
-        BSP["BSP Traversal"]
-        SoftRender["Software Renderer"]
+    subgraph Engine[Engine — C11, 1996]
+        Host[Host_Frame]
+        Physics[SV_Physics]
+        BSPWalk[R_MarkLeaves + BSP]
+        Soft[Software raster 320x240]
     end
 
-    subgraph "Metal Pipeline"
-        Composite["Metal Texture Composite"]
-        RT["RT Shader (active)"]
-        PostFX["PostFX Pipeline (12-stage)"]
-        MeshShader["Mesh Shaders (active fallback)"]
-        MetalFX["MetalFX Spatial+Temporal"]
-        MPS["MPSGraph (Denoiser/Upscaler)"]
+    subgraph RT[Metal RT path]
+        Build[BuildRTXWorld]
+        IAS[Instance AS unified / split]
+        Kernel[raytraceMain compute]
+        SVGF[SVGF reproject + variance]
+        Bilateral[Bilateral atrous]
+        MFX[MetalFX Temporal + Frame Interp]
     end
 
-    subgraph "Audio"
-        CoreAudio["Core Audio (active)"]
-        PHASE["PHASE Spatial (active)"]
-        Haptics["Core Haptics (active)"]
+    subgraph Composite[Composite + PostFX fragment]
+        Chroma[Chromakey index 254]
+        PostFX[12 stage PostFX]
     end
 
-    subgraph "Input"
-        Mouse["CGEvent Mouse (active)"]
-        Controller["GameController (active)"]
-        Keys["Carbon Keyboard (active)"]
+    subgraph Audio
+        CA[Core Audio ring]
+        PHASE[PHASE BSP occluder]
+        Haptics[CHHaptic + DualSense]
     end
 
-    Launcher --> GameLoop
-    GameLoop --> Physics & BSP
-    BSP --> SoftRender --> Composite
-    RT -.-> MPS -.-> PostFX -.-> MetalFX
-    GameLoop --> CoreAudio & PHASE & Haptics
-    Mouse & Controller & Keys --> GameLoop
+    subgraph Input
+        NSE[NSEvent + FlagsChanged]
+        CG[CGEvent mouse deltas]
+        Ctrl[GCController + gyro]
+    end
+
+    MQ -->|bridge sync| Host
+    Host --> Physics --> BSPWalk --> Soft
+    Host --> Build --> IAS --> Kernel --> SVGF --> Bilateral --> MFX
+
+    Soft --> Chroma
+    MFX --> Chroma
+    Chroma --> PostFX --> Drawable[present drawable]
+
+    Host --> CA
+    Host --> PHASE
+    Host --> Haptics
+
+    NSE --> Host
+    CG --> Host
+    Ctrl --> Host
 ```
+
+Deep dives: `TECHNICAL.md` covers acceleration-structure topology,
+SVGF data flow, argument buffers, ReSTIR DI, PHASE BSP occluder, the
+bridge/launcher design, and the complete cvar reference — each section
+has its own mermaid diagram.
 
 ---
 
@@ -133,17 +167,34 @@ open build/Quake.app
 
 ## New Cvars
 
-Beyond Quake's classic console variables, v1.3+ adds:
+Beyond Quake's classic console variables, the Apple Silicon port adds:
 
 | Cvar | Default | Description |
 |---|---|---|
-| `r_svgf` | 0 | Temporal reprojection denoise pre-pass on top of the bilateral à-trous |
-| `r_frameinterp` | 0 | MetalFX Frame Interpolation placeholder (probed at boot) |
+| `vid_rtx` | 1 | Toggle path-traced world |
+| `r_svgf` | 0 | 0 off · 1 temporal reprojection · 2 full variance-guided SVGF |
+| `r_frameinterp` | 0 | MetalFX Frame Interpolation encode pass (macOS 15+) |
+| `r_rt_split_blas` | 0 | Split world + entity BLAS with 2-instance IAS + metadata offset indirection |
+| `r_restir` | 0 | ReSTIR DI reservoir sampling over emissive world triangles |
+| `vid_vsync` | 0 | `CAMetalLayer.displaySyncEnabled` |
+| `vid_fullscreen` | 0 | Toggle native fullscreen via `-[NSWindow toggleFullScreen:]` |
 | `joy_gyro_enabled` | 0 | Add controller gyro deltas to view angles |
-| `joy_gyro_yaw` | 30.0 | Gyro yaw sensitivity (deg/sec per rad/sec) |
+| `joy_gyro_yaw` | 30.0 | Gyro yaw sensitivity |
 | `joy_gyro_pitch` | 20.0 | Gyro pitch sensitivity |
+| `joy_sensitivity` | 1.0 | Global stick / gyro sensitivity scale |
+| `showfps` | 0 | Top-right FPS overlay (0.25 s smoothing window) |
 
-The Video Options menu exposes every toggle live in-game; the SwiftUI launcher mirrors the same state via `@AppStorage` and writes `id1/metal_quake.cfg` on Apply.
+Console commands: **`mq_info`** dumps hardware + feature state,
+**`dumpcvars`** lists every registered cvar.
+
+Environment: **`MQ_MPS_DENOISE=1`** opts into the GPU Gaussian denoise
+path over the default bilateral à-trous. **`MQ_SIGN_IDENTITY="Developer
+ID Application: …"`** selects a real code-signing identity instead of
+the ad-hoc `-` that `build.sh` uses by default.
+
+The in-game Video Options menu exposes the main toggles live; the
+SwiftUI launcher mirrors the full set via `@AppStorage` and writes
+`id1/metal_quake.cfg` on Apply.
 
 > [!CAUTION]
 > This repository contains **no proprietary game assets**. You must provide your own `id1/pak0.pak`.

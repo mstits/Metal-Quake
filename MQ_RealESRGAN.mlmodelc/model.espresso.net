@@ -12,7 +12,7 @@
   ],
   "layers" : [
     {
-      "top" : "output",
+      "top" : "up",
       "use_fractional_scale_factors" : false,
       "weights" : {
 
@@ -21,16 +21,56 @@
       "type" : "upsample",
       "scaling_factor_x" : 4,
       "mode" : 1,
-      "attributes" : {
-        "is_output" : 1
-      },
       "align_corners" : 0,
       "bottom" : "input",
-      "debug_info" : "upsample4x",
+      "debug_info" : "bilinear4x",
       "fractional_scaling_factor_x" : 1,
       "is_legacy_mode" : 1,
-      "name" : "upsample4x",
+      "name" : "bilinear4x",
       "scaling_factor_y" : 4
+    },
+    {
+      "pad_r" : 0,
+      "fused_relu" : 0,
+      "fused_tanh" : 0,
+      "debug_info" : "sharpen",
+      "pad_fill_mode" : 0,
+      "pad_b" : 0,
+      "pad_l" : 0,
+      "top" : "sharp",
+      "blob_weights" : 1,
+      "K" : 3,
+      "name" : "sharpen",
+      "has_batch_norm" : 0,
+      "type" : "convolution",
+      "n_groups" : 3,
+      "pad_t" : 0,
+      "has_biases" : 0,
+      "C" : 3,
+      "bottom" : "up",
+      "weights" : {
+
+      },
+      "Nx" : 3,
+      "pad_mode" : 1,
+      "pad_value" : 0,
+      "Ny" : 3,
+      "n_parallel" : 1
+    },
+    {
+      "bottom" : "sharp",
+      "beta" : 0,
+      "weights" : {
+
+      },
+      "mode" : 6,
+      "debug_info" : "passthrough",
+      "top" : "output",
+      "type" : "activation",
+      "name" : "passthrough",
+      "attributes" : {
+        "is_output" : 1
+      }
     }
   ]
 }

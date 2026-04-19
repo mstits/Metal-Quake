@@ -1,27 +1,31 @@
 [
   {
     "metadataOutputVersion" : "3.0",
+    "shortDescription" : "Metal Quake 4× upscaler — bilinear + unsharp depthwise conv",
     "outputSchema" : [
       {
         "hasShapeFlexibility" : "0",
         "isOptional" : "0",
         "dataType" : "Double",
-        "formattedType" : "MultiArray (Double 3 × 800 × 1280)",
+        "formattedType" : "MultiArray (Double 3 × 960 × 1280)",
         "shortDescription" : "",
-        "shape" : "[3, 800, 1280]",
+        "shape" : "[3, 960, 1280]",
         "name" : "output",
         "type" : "MultiArray"
       }
     ],
+    "storagePrecision" : "Float32",
     "modelParameters" : [
 
     ],
+    "author" : "Metal Quake engine",
     "specificationVersion" : 1,
+    "license" : "GPL-2.0 (engine) \/ user-provided (weights)",
     "computePrecision" : "Float16",
-    "isUpdatable" : "0",
     "stateSchema" : [
 
     ],
+    "isUpdatable" : "0",
     "availability" : {
       "macOS" : "10.13",
       "tvOS" : "11.0",
@@ -33,24 +37,26 @@
     "modelType" : {
       "name" : "MLModelType_neuralNetwork"
     },
-    "userDefinedMetadata" : {
-
-    },
     "inputSchema" : [
       {
         "hasShapeFlexibility" : "0",
         "isOptional" : "0",
         "dataType" : "Double",
-        "formattedType" : "MultiArray (Double 3 × 200 × 320)",
+        "formattedType" : "MultiArray (Double 3 × 240 × 320)",
         "shortDescription" : "",
-        "shape" : "[3, 200, 320]",
+        "shape" : "[3, 240, 320]",
         "name" : "input",
         "type" : "MultiArray"
       }
     ],
+    "userDefinedMetadata" : {
+
+    },
     "generatedClassName" : "MQ_RealESRGAN",
     "neuralNetworkLayerTypeHistogram" : {
-      "UpsampleBiLinear" : 1
+      "ActivationLinear" : 1,
+      "UpsampleBiLinear" : 1,
+      "Convolution" : 1
     },
     "method" : "predict"
   }

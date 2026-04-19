@@ -154,6 +154,14 @@ static uint32_t _worldTriCount = 0;
 static std::vector<uint32_t>       _emissiveTriIndices;
 static MTL::Buffer*                _pEmissiveTriBuffer = nullptr;
 
+// Argument-buffer state for the RT dispatch. _pRTArgBuffer holds 6
+// device-pointer slots encoded by the argument encoder derived from
+// the raytraceMain function at BuildPipeline time. The encoder retains
+// the function so we keep it for the process lifetime.
+static MTL::Function*              _pRTFunction           = nullptr;
+static MTL::ArgumentEncoder*       _pRTArgEncoder         = nullptr;
+static MTL::Buffer*                _pRTArgBuffer          = nullptr;
+
 static MTL::ComputePipelineState* _pRTComputeState = nullptr;
 static MTL::Texture* _pRTOutputTexture = nullptr;
 static MTL::Texture* _pRTDepthTexture = nullptr;      // MetalFX temporal: depth
@@ -1390,6 +1398,18 @@ static void BuildPipeline() {
             }
         }
 
+        // Function constants for pipeline specialization. When a constant
+        // is false at pipeline-build time the compiler dead-code-eliminates
+        // the corresponding branch entirely. We keep the per-frame runtime
+        // uniforms too so the 32-variant cache (2^5) isn't strictly needed
+        // — the fallback default pipeline binds all constants true and
+        // falls back to runtime gating.
+        constant bool fc_ssao        [[function_constant(0)]];
+        constant bool fc_crt         [[function_constant(1)]];
+        constant bool fc_liquidglass [[function_constant(2)]];
+        constant bool fc_chroma      [[function_constant(3)]];
+        constant bool fc_hc_hud      [[function_constant(4)]];
+
         // Packed uniforms: screenBlend + time + flags + resolution.
         // Explicit padding keeps 16-byte alignment on every float4-sized
         // row so the Metal validation layer doesn't complain on stricter
@@ -1515,7 +1535,7 @@ static void BuildPipeline() {
             color *= mix(0.65, 1.0, vig);
             
             // 5.5. SSAO — Screen-Space Ambient Occlusion from RT depth
-            if (u.ssao_enabled > 0.5) {
+            if (fc_ssao && u.ssao_enabled > 0.5) {
                 constexpr sampler ssaoSamp(filter::linear);
                 float centerDepth = depthTex.sample(ssaoSamp, in.texCoord).r;
                 // RT shader writes raw world-unit distance (up to ~100000);
@@ -1556,7 +1576,7 @@ static void BuildPipeline() {
             }
             
             // 8. CRT Scanline Filter — retro monitor emulation
-            if (u.crt_mode > 0.5) {
+            if (fc_crt && u.crt_mode > 0.5) {
                 float2 crtUV = in.texCoord;
                 // Barrel distortion (subtle CRT curvature)
                 float2 dc = crtUV - 0.5;
@@ -1587,7 +1607,7 @@ static void BuildPipeline() {
             // 9. Liquid Glass HUD — frosted glass overlay on status bar.
             // HUD band Y is aspect-aware (wider display → thinner band) so
             // the ribbon doesn't swallow the whole screen on 21:9 / 32:9.
-            if (u.liquid_glass > 0.5) {
+            if (fc_liquidglass && u.liquid_glass > 0.5) {
                 float2 hudUV = in.texCoord;
                 float bandTop = u.hud_band_y > 0.01 ? u.hud_band_y : 0.82;
                 float hudMask = smoothstep(bandTop, bandTop + 0.03, hudUV.y);
@@ -1622,7 +1642,7 @@ static void BuildPipeline() {
             // 9b. Global Chromatic Aberration — subtle lens fringing. Runs
             // before EDR so the aberration is tone-mapped along with the
             // rest of the color. Strength is gated by user cvar.
-            if (u.chromatic_aberration > 0.5) {
+            if (fc_chroma && u.chromatic_aberration > 0.5) {
                 float2 caCenter = in.texCoord - 0.5;
                 float caDist = dot(caCenter, caCenter); // squared — cheap
                 float caAmt = 0.002 * caDist * 4.0;     // 0 at center, up to ~0.008 at corners
@@ -1640,7 +1660,7 @@ static void BuildPipeline() {
             // 9c. High-Contrast HUD — accessibility. Boosts saturation and
             // contrast on the bottom HUD band only, leaving the 3D world
             // alone. Combines with Liquid Glass (both can be on at once).
-            if (u.high_contrast_hud > 0.5) {
+            if (fc_hc_hud && u.high_contrast_hud > 0.5) {
                 float bandTop = u.hud_band_y > 0.01 ? u.hud_band_y : 0.82;
                 float hcMask = smoothstep(bandTop, bandTop + 0.02, in.texCoord.y);
                 if (hcMask > 0.01) {
@@ -1673,7 +1693,25 @@ static void BuildPipeline() {
         exit(1);
     }
     auto* pVertexFn = pLib->newFunction(NS::String::string("vertexMain", UTF8StringEncoding));
-    auto* pFragFn = pLib->newFunction(NS::String::string("fragmentMain", UTF8StringEncoding));
+    // All 5 function constants must be bound at pipeline-build time
+    // or Metal refuses to compile the fragment. The default pipeline
+    // binds them all true so every runtime-gated branch behaves
+    // identically to the pre-specialization path. The pipeline cache
+    // built below will create additional variants with specific
+    // constants set to false for dead-code elimination.
+    bool fcTrue = true;
+    auto* pDefaultFCV = MTL::FunctionConstantValues::alloc()->init();
+    for (int i = 0; i < 5; i++) {
+        pDefaultFCV->setConstantValue(&fcTrue, MTL::DataTypeBool, i);
+    }
+    NS::Error* pFCErr = nullptr;
+    auto* pFragFn = pLib->newFunction(NS::String::string("fragmentMain", UTF8StringEncoding),
+                                       pDefaultFCV, &pFCErr);
+    if (pFCErr) {
+        printf("PostFX fragment (default FCV) compile error: %s\n",
+               pFCErr->localizedDescription()->utf8String());
+    }
+    pDefaultFCV->release();
     auto* pDesc = MTL::RenderPipelineDescriptor::alloc()->init();
     pDesc->setVertexFunction(pVertexFn); pDesc->setFragmentFunction(pFragFn);
     pDesc->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
@@ -1783,6 +1821,21 @@ static void BuildPipeline() {
             return fract(sin(dot(p, float2(127.1, 311.7))) * 43758.5453);
         }
 
+        // Argument buffer — wraps the 6 RT device pointers into one bind.
+        // IDs 0..5 correspond to the previous per-slot positional
+        // parameters (vertices was buffer 5, indices 6, etc). Moving to
+        // an argument buffer halves the setBuffer call count per RT
+        // dispatch and enables the driver to page the backing store once
+        // via the useResource annotations rather than on every bind.
+        struct RTArgs {
+            device const RTVertex*    vertices        [[id(0)]];
+            device const uint*        indices         [[id(1)]];
+            device const TriTexInfo*  triTexInfos     [[id(2)]];
+            device const GPUDynLight* dynLights       [[id(3)]];
+            device const uint*        instanceOffsets [[id(4)]];
+            device const uint*        emissiveTris    [[id(5)]];
+        };
+
         kernel void raytraceMain(uint2 tid [[thread_position_in_grid]],
             texture2d<float, access::write> outTexture [[texture(0)]],
             texture2d<float, access::read> atlasTexture [[texture(1)]],
@@ -1791,10 +1844,9 @@ static void BuildPipeline() {
             constant float4& camForward [[buffer(2)]],
             constant float4& camRight [[buffer(3)]],
             constant float4& camUp [[buffer(4)]],
-            device const RTVertex* vertices [[buffer(5)]],
-            device const uint* indices [[buffer(6)]],
-            device const TriTexInfo* triTexInfos [[buffer(7)]],
-            device const GPUDynLight* dynLights [[buffer(8)]],
+            // Single argument buffer replaces the 6 device-pointer
+            // positional params that used to live at buffers 5/6/7/8/17/18.
+            constant const RTArgs& rtArgs [[buffer(5)]],
             constant int& numLights [[buffer(9)]],
             constant float& time [[buffer(10)]],
             texture2d<float, access::write> depthTexture [[texture(2)]],
@@ -1805,23 +1857,18 @@ static void BuildPipeline() {
             constant float4& prevCamUp [[buffer(14)]],
             constant int&    rtQuality [[buffer(15)]],
             constant int&    underwaterFlag [[buffer(16)]],
-            // Per-instance metadata offsets — maps instance_id to a base
-            // index into the global triTexInfos buffer. When the split-
-            // BLAS path is OFF, this is a single-entry buffer [0] so
-            // instance 0 (the unified BLAS) reads triTexInfos[0 + primId].
-            // When ON, it's [0, worldTriCount] so the world instance
-            // reads from the start and the entity instance reads from
-            // the entity base.
-            device const uint* instanceOffsets [[buffer(17)]],
-            // ReSTIR DI — global primitive_id list of emissive triangles
-            // in the world BLAS. When r_restir is on, the shader
-            // reservoir-samples N candidates from this list, weighted by
-            // inverse-square distance, and casts one shadow ray to the
-            // chosen triangle's centroid.
-            device const uint* emissiveTris  [[buffer(18)]],
-            constant int&      emissiveCount [[buffer(19)]],
-            constant int&      useReSTIR     [[buffer(20)]])
+            constant int&    emissiveCount [[buffer(19)]],
+            constant int&    useReSTIR     [[buffer(20)]])
         {
+            // Local aliases so the existing shader body keeps reading
+            // `vertices[i]` etc. Compiled by the optimizer into direct
+            // loads through the argument buffer — no runtime cost.
+            device const RTVertex*    vertices        = rtArgs.vertices;
+            device const uint*        indices         = rtArgs.indices;
+            device const TriTexInfo*  triTexInfos     = rtArgs.triTexInfos;
+            device const GPUDynLight* dynLights       = rtArgs.dynLights;
+            device const uint*        instanceOffsets = rtArgs.instanceOffsets;
+            device const uint*        emissiveTris    = rtArgs.emissiveTris;
             if (tid.x >= outTexture.get_width() || tid.y >= outTexture.get_height()) return;
             float2 uv = (float2(tid) / float2(outTexture.get_width(), outTexture.get_height())) * 2.0 - 1.0;
             uv.y = -uv.y; uv.x *= (float)outTexture.get_width() / (float)outTexture.get_height();
@@ -2340,7 +2387,19 @@ static void BuildPipeline() {
     if (pRTLib) {
         auto* pRTFn = pRTLib->newFunction(NS::String::string("raytraceMain", UTF8StringEncoding));
         _pRTComputeState = _pDevice->newComputePipelineState(pRTFn, &pError);
-        pRTFn->release(); pRTLib->release();
+        // Retain the function for argument-encoder derivation below.
+        // Released in VID_Shutdown.
+        _pRTFunction = pRTFn;
+        _pRTArgEncoder = pRTFn->newArgumentEncoder(5);
+        if (_pRTArgEncoder) {
+            _pRTArgBuffer = _pDevice->newBuffer(
+                _pRTArgEncoder->encodedLength(),
+                MTL::ResourceStorageModeShared);
+            _pRTArgBuffer->setLabel(NS::String::string("RT arg buffer", NS::UTF8StringEncoding));
+            Con_Printf("RT: argument buffer ready (%lu bytes)\n",
+                       (unsigned long)_pRTArgEncoder->encodedLength());
+        }
+        pRTLib->release();
     }
     pLib->release(); pDesc->release();
 }
@@ -2898,12 +2957,50 @@ extern "C" void VID_Update(vrect_t *rects) {
                 float fRight[4] = { vright[0], vright[1], vright[2], 0.0f };
                 float fUp[4] = { vup[0], vup[1], vup[2], 0.0f };
                 pCompEnc->setBytes(&fOrigin, 16, 1); pCompEnc->setBytes(&fForward, 16, 2); pCompEnc->setBytes(&fRight, 16, 3); pCompEnc->setBytes(&fUp, 16, 4);
-                pCompEnc->setBuffer(_pRTVertexBuffer, 0, 5); pCompEnc->setBuffer(_pRTIndexBuffer, 0, 6);
-                if (_pTriTexInfoBuffer) pCompEnc->setBuffer(_pTriTexInfoBuffer, 0, 7);
-                if (_pDynLightBuffer) pCompEnc->setBuffer(_pDynLightBuffer, 0, 8);
-                else {
-                    GPUDynLight dummy = {0,0,0,0};
-                    pCompEnc->setBytes(&dummy, sizeof(dummy), 8);
+
+                // --- Populate + bind the RT argument buffer at slot 5 ---
+                //
+                // A shader with an argument-buffer parameter expects
+                // ALL slots in the struct to be populated, even if a
+                // given code path doesn't read them. We write each
+                // pointer (or a 1-entry scratch for optional/nil
+                // resources) and then useResource: annotate the
+                // command encoder so the driver pages each buffer into
+                // GPU-visible memory for the dispatch.
+                static MTL::Buffer* _dummyDynLightBuf = nullptr;
+                if (!_dummyDynLightBuf) {
+                    GPUDynLight zeros[1] = {{0,0,0,0}};
+                    _dummyDynLightBuf = _pDevice->newBuffer(zeros, sizeof(zeros), MTL::ResourceStorageModeShared);
+                }
+                static MTL::Buffer* _dummyEmissiveBuf = nullptr;
+                if (!_dummyEmissiveBuf) {
+                    uint32_t zeros[1] = {0u};
+                    _dummyEmissiveBuf = _pDevice->newBuffer(zeros, sizeof(zeros), MTL::ResourceStorageModeShared);
+                }
+                MTL::Buffer* vBuf  = _pRTVertexBuffer;
+                MTL::Buffer* iBuf  = _pRTIndexBuffer;
+                MTL::Buffer* tBuf  = _pTriTexInfoBuffer;
+                MTL::Buffer* dBuf  = _pDynLightBuffer ? _pDynLightBuffer : _dummyDynLightBuf;
+                MTL::Buffer* oBuf  = _pInstanceOffsetsBuffer;
+                MTL::Buffer* eBuf  = _pEmissiveTriBuffer ? _pEmissiveTriBuffer : _dummyEmissiveBuf;
+                if (_pRTArgEncoder && _pRTArgBuffer && vBuf && iBuf && tBuf && oBuf) {
+                    _pRTArgEncoder->setArgumentBuffer(_pRTArgBuffer, 0);
+                    _pRTArgEncoder->setBuffer(vBuf, 0, 0);
+                    _pRTArgEncoder->setBuffer(iBuf, 0, 1);
+                    _pRTArgEncoder->setBuffer(tBuf, 0, 2);
+                    _pRTArgEncoder->setBuffer(dBuf, 0, 3);
+                    _pRTArgEncoder->setBuffer(oBuf, 0, 4);
+                    _pRTArgEncoder->setBuffer(eBuf, 0, 5);
+                    pCompEnc->setBuffer(_pRTArgBuffer, 0, 5);
+                    // The driver must page the underlying buffers for
+                    // the dispatch since they're reached only through
+                    // the argument buffer pointers.
+                    pCompEnc->useResource(vBuf, MTL::ResourceUsageRead);
+                    pCompEnc->useResource(iBuf, MTL::ResourceUsageRead);
+                    pCompEnc->useResource(tBuf, MTL::ResourceUsageRead);
+                    pCompEnc->useResource(dBuf, MTL::ResourceUsageRead);
+                    pCompEnc->useResource(oBuf, MTL::ResourceUsageRead);
+                    pCompEnc->useResource(eBuf, MTL::ResourceUsageRead);
                 }
                 pCompEnc->setBytes(&_numActiveLights, sizeof(int), 9);
                 float shaderTime = (float)realtime;
@@ -2920,24 +3017,10 @@ extern "C" void VID_Update(vrect_t *rects) {
                 int underwaterBind = (r_viewleaf && r_viewleaf->contents <= CONTENTS_WATER
                                       && MQ_GetSettings()->underwater_fx) ? 1 : 0;
                 pCompEnc->setBytes(&underwaterBind, sizeof(int), 16);
-                // Per-instance metadata offsets. Slot [0] = 0 for the
-                // unified-BLAS path. When r_rt_split_blas is live, slot
-                // [1] = worldTriCount so the entity BLAS's primitive_ids
-                // index the tail of the triTexInfos array.
-                if (_pInstanceOffsetsBuffer) {
-                    pCompEnc->setBuffer(_pInstanceOffsetsBuffer, 0, 17);
-                }
-                // ReSTIR emissive-triangle list + count + gate.
-                if (_pEmissiveTriBuffer) {
-                    pCompEnc->setBuffer(_pEmissiveTriBuffer, 0, 18);
-                } else {
-                    // Need to bind SOMETHING at slot 18 — the shader
-                    // indexes it even when useReSTIR is 0 (compiler
-                    // may hoist the load). A dummy 4-byte zero buffer
-                    // keeps the driver happy.
-                    uint32_t zero = 0;
-                    pCompEnc->setBytes(&zero, sizeof(zero), 18);
-                }
+                // instanceOffsets (was slot 17) and emissiveTris (was
+                // slot 18) are now inside the argument buffer at ids 4
+                // and 5 — no per-slot bind needed. emissiveCount +
+                // useReSTIR remain as scalar setBytes below.
                 int emissiveCountBind = (int)_emissiveTriIndices.size();
                 pCompEnc->setBytes(&emissiveCountBind, sizeof(int), 19);
                 cvar_t *restirCvar = Cvar_FindVar((char*)"r_restir");
@@ -3283,6 +3366,9 @@ extern "C" void VID_Shutdown(void) {
         MQ_Residency_Release(_pResidencySet);
         _pResidencySet = nullptr;
     }
+    if (_pRTArgEncoder) { _pRTArgEncoder->release(); _pRTArgEncoder = nullptr; }
+    if (_pRTArgBuffer)  { _pRTArgBuffer->release();  _pRTArgBuffer  = nullptr; }
+    if (_pRTFunction)   { _pRTFunction->release();   _pRTFunction   = nullptr; }
 }
 extern "C" void D_BeginDirectRect(int x, int y, byte *pbitmap, int width, int height) {}
 extern "C" void D_EndDirectRect(int x, int y, int width, int height) {}

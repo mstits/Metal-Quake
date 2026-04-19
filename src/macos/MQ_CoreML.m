@@ -187,6 +187,67 @@ int MQ_CoreML_UpscaleTexture(const uint8_t *inputPixels, uint8_t *outputPixels,
     if (!coremlDevice || !coremlQueue || !inputPixels || !outputPixels) return -1;
     if (inW <= 0 || inH <= 0) return -1;
 
+    // --- Preferred path: MLModel prediction on ANE ---
+    //
+    // The model was compiled with a fixed 240×320 input shape (matching
+    // vid_metal.cpp's default internal RT resolution). If the caller
+    // passes different dimensions we fall through to the MPSGraph path
+    // below, which rebuilds a graph for the size on demand.
+    if (_upscalerModel && inW == 320 && inH == 240) {
+        @autoreleasepool {
+            NSError *err = nil;
+            MLMultiArray *mlIn = [[MLMultiArray alloc] initWithShape:@[@3, @240, @320]
+                                                            dataType:MLMultiArrayDataTypeFloat32
+                                                               error:&err];
+            if (!mlIn || err) {
+                Con_Printf("CoreML: upscaler MLMultiArray alloc failed\n");
+            } else {
+                // Fill planar CHW from packed RGBA8. Matches the
+                // MPSGraph fallback's input layout.
+                float *fin = (float *)mlIn.dataPointer;
+                const int pixelCount = inW * inH;
+                for (int i = 0; i < pixelCount; i++) {
+                    fin[0 * pixelCount + i] = inputPixels[i * 4 + 0] / 255.0f;
+                    fin[1 * pixelCount + i] = inputPixels[i * 4 + 1] / 255.0f;
+                    fin[2 * pixelCount + i] = inputPixels[i * 4 + 2] / 255.0f;
+                }
+
+                MLFeatureValue *fv = [MLFeatureValue featureValueWithMultiArray:mlIn];
+                MLDictionaryFeatureProvider *prov = [[MLDictionaryFeatureProvider alloc]
+                    initWithDictionary:@{@"input": fv} error:&err];
+                if (prov && !err) {
+                    id<MLFeatureProvider> result = [_upscalerModel predictionFromFeatures:prov error:&err];
+                    if (result && !err) {
+                        MLFeatureValue *outFV = [result featureValueForName:@"output"];
+                        MLMultiArray *mlOut = outFV.multiArrayValue;
+                        if (mlOut) {
+                            // Output shape is (3, 960, 1280) for a 4× upscale.
+                            const int outW = inW * 4, outH = inH * 4;
+                            const int outPixels = outW * outH;
+                            const float *fout = (const float *)mlOut.dataPointer;
+                            for (int i = 0; i < outPixels; i++) {
+                                float r = fout[0 * outPixels + i];
+                                float g = fout[1 * outPixels + i];
+                                float b = fout[2 * outPixels + i];
+                                if (r < 0) r = 0; else if (r > 1) r = 1;
+                                if (g < 0) g = 0; else if (g > 1) g = 1;
+                                if (b < 0) b = 0; else if (b > 1) b = 1;
+                                outputPixels[i * 4 + 0] = (uint8_t)(r * 255.0f);
+                                outputPixels[i * 4 + 1] = (uint8_t)(g * 255.0f);
+                                outputPixels[i * 4 + 2] = (uint8_t)(b * 255.0f);
+                                outputPixels[i * 4 + 3] = 255;
+                            }
+                            return 0;
+                        }
+                    }
+                    if (err) Con_Printf("CoreML upscaler prediction failed: %s\n",
+                                        [[err localizedDescription] UTF8String]);
+                }
+            }
+        }
+        // Fall through to MPSGraph on any MLModel failure.
+    }
+
     @autoreleasepool {
         // Upscaler graph: bilinear 4× followed by a hand-weighted 3×3
         // unsharp-mask convolution. The convolution is NOT a learned

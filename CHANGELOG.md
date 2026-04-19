@@ -4,10 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+_No entries yet._
+
+---
+
+## [1.4.0] — 2026-04-19
+
 ### Added
 
 - **BLAS refit path** — when the frame's triangle count matches the previous frame's, the per-frame BLAS update now uses `refitAccelerationStructure` instead of rebuilding from scratch. 3–5× faster on Apple Silicon for stable-topology frames.
-- **CoreML `MLModel` load at init** — `MQ_Denoiser.mlmodelc` / `MQ_RealESRGAN.mlmodelc` are loaded with `MLComputeUnitsAll` so they'll run on the ANE when a trained model is dropped in; falls back to the MPS placeholders otherwise.
+- **Split world/entity BLAS** behind `r_rt_split_blas`. World BLAS is built once per map (cache keyed on worldmodel pointer + surface count) and reused; entity BLAS rebuilds per frame for moving geometry. The shader now always traverses an `instance_acceleration_structure` with a per-instance offsets buffer, so the single-BLAS fallback is a 1-instance IAS wrapping the unified BLAS — no shader fork.
+- **ReSTIR DI** behind `r_restir`. Per-pixel weighted reservoir importance sampling over a CPU-side emissive-triangle list (built from the atlas' brightest texels via 8×8 grid-sample). 4 candidates per pixel, RIS-weighted selection feeding the shadow-ray probe.
+- **Argument buffer consolidation**. RT ray dispatch now binds a single `MTLArgumentEncoder`-populated buffer at slot 5 holding the 6 device pointers previously passed one-slot-at-a-time (skins atlas, entities, motion vectors, emissive list, reservoirs, instance offsets). Per-frame encode cost is a cache-line write; shader decode is zero overhead.
+- **PostFX function constants** — 5 `MTLFunctionConstantValues` (`fc_ssao`, `fc_crt`, `fc_liquidglass`, `fc_chroma`, `fc_hc_hud`) let the compositor fragment pipeline compile out disabled stages rather than runtime-branch. Default pipeline binds all 5 to true; infrastructure in place for cache-keyed specialized variants.
+- **CoreML `MLModel` load at init** — `MQ_Denoiser.mlmodelc` / `MQ_RealESRGAN.mlmodelc` are loaded with `MLComputeUnitsAll` so they run on the ANE. `scripts/create_coreml_models.py` ships deterministic multi-layer conv networks (soft-Gaussian residual denoiser; bilinear 4× + unsharp 3×3 upscaler) as the baked weights; drop in a trained Real-ESRGAN checkpoint to override.
 - **`vid_vsync`** cvar (0=uncapped, 1=display sync). Hot-applied via `CAMetalLayer.displaySyncEnabled` on the main thread.
 - **`vid_fullscreen`** cvar. Flips the window through `-[NSWindow toggleFullScreen:]`; the collection behavior is set to `NSWindowCollectionBehaviorFullScreenPrimary` at window creation.
 - **`MQBridge_ToggleCvar`** for the launcher to flip bool cvars atomically without relying on a legacy `toggle` console command.
@@ -28,6 +38,9 @@ All notable changes to this project will be documented in this file.
 - **Launcher hot-reload** — FOV, gamma, HUD scale, SFX/music volumes, sensitivity, deadzone, rumble intensity, invert-Y, raw-mouse all re-sync cvars as sliders move, not just on Apply.
 - **Minimal test harness** (`tests/run.sh`) with two passing tests that covers settings round-trip (caught a real parser bug) and UDP address compare semantics.
 - **Distribution pipeline docs** — `build.sh` now honors `MQ_SIGN_IDENTITY`, ships `--options runtime`, and the inline comment block documents the full `notarytool` + `stapler` flow.
+- **Modifier-key event routing** — `NSEventTypeFlagsChanged` handler translates Shift/Ctrl/Option transitions to `Key_Event(K_SHIFT/K_CTRL/K_ALT)` so the console `~` + `_` path and bind targets that need modifier state actually receive it.
+- **View-section launcher sliders** — FOV, gamma, HUD scale exposed in the SwiftUI settings tab, bound to `Metal_Settings` fields and hot-applied through `MQBridge_SetCvarFloat`.
+- **PHASE asset dedup** by sound name; stereo-channel assignment fix (was collapsing to mono on any 2-ch sample).
 
 ### Fixed
 
