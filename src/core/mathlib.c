@@ -364,7 +364,10 @@ vec_t Length(vec3_t v) {
   length = 0;
   for (i = 0; i < 3; i++)
     length += v[i] * v[i];
-  length = sqrt(length); // FIXME
+  // Original FIXME was from when sqrt was an approximation target — on
+  // Apple Silicon's VFP a call to libm sqrt is one instruction, so we
+  // just use it. Fast-math path removed.
+  length = sqrtf(length);
 
   return length;
 }
@@ -373,7 +376,7 @@ float VectorNormalize(vec3_t v) {
   float length, ilength;
 
   length = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
-  length = sqrt(length); // FIXME
+  length = sqrtf(length);
 
   if (length) {
     ilength = 1 / length;

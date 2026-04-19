@@ -1,7 +1,9 @@
 #!/bin/bash
 
 # Comprehensive build script for modern Quake on Apple Silicon
-set -e
+# Fail fast on any command error including inside pipelines so a silent
+# compile failure in one stage can't propagate a stale binary forward.
+set -eo pipefail
 
 # Compile options
 # -Wno-everything is used here to suppress warnings from the 1996 codebase
@@ -10,12 +12,13 @@ CXX="clang++"
 CC="clang"
 CFLAGS="-O3 -g -std=c11 -I. -I./src/core -I./src/macos -I./metal-cpp -Wno-everything"
 CXXFLAGS="-O3 -g -std=c++17 -fobjc-arc -I. -I./src/core -I./src/macos -I./metal-cpp -Wno-everything"
-LDFLAGS="-framework Foundation -framework Metal -framework QuartzCore -framework GameController -framework CoreHaptics -framework Network -framework AudioUnit -framework AudioToolbox -framework AppKit -framework MetalKit"
+OBJCFLAGS="-O3 -g -std=c11 -fobjc-arc -I. -I./src/core -I./src/macos -I./metal-cpp -Wno-everything"
+LDFLAGS="-framework Foundation -framework Metal -framework QuartzCore -framework GameController -framework CoreHaptics -framework Network -framework CoreAudio -framework AudioUnit -framework AudioToolbox -framework AppKit -framework MetalKit"
 
 # Weak-link frameworks not on all macOS versions
 LDFLAGS="$LDFLAGS -Wl,-weak_framework,MetalFX"
 LDFLAGS="$LDFLAGS -Wl,-weak_framework,PHASE"
-LDFLAGS="$LDFLAGS -framework CoreML -framework GameKit"
+LDFLAGS="$LDFLAGS -framework CoreML -framework GameKit -framework MetricKit"
 # Apple-native frameworks for improvements
 LDFLAGS="$LDFLAGS -framework Accelerate -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework NaturalLanguage"
 
@@ -104,6 +107,8 @@ MACOS_SOURCES=(
     src/macos/MQ_PHASE_Audio.m
     src/macos/MQ_CoreML.m
     src/macos/MQ_Ecosystem.m
+    src/macos/MQ_FrameInterp.m
+    src/macos/MQ_Residency.m
 )
 
 # Metal shader sources
@@ -166,6 +171,8 @@ for f in "${MACOS_SOURCES[@]}"; do
         echo "Compiling $f..."
         if [ "$ext" == "cpp" ] || [ "$ext" == "mm" ]; then
             $CXX $CXXFLAGS -c "$f" -o "$obj"
+        elif [ "$ext" == "m" ]; then
+            $CC $OBJCFLAGS -c "$f" -o "$obj"
         else
             $CC $CFLAGS -c "$f" -o "$obj"
         fi
@@ -225,21 +232,79 @@ cat << 'EOF' > build/Quake.app/Contents/Info.plist
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
     <key>CFBundleExecutable</key>
     <string>Quake</string>
     <key>CFBundleIdentifier</key>
     <string>com.metalquake.engine</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
     <key>CFBundleName</key>
     <string>Metal Quake</string>
+    <key>CFBundleDisplayName</key>
+    <string>Metal Quake</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.2.0</string>
     <key>CFBundleVersion</key>
-    <string>1.0</string>
+    <string>1200</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
     <key>LSApplicationCategoryType</key>
-    <string>public.app-category.games</string>
+    <string>public.app-category.action-games</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>Quake engine © 1996 id Software. Distributed under GPLv2.</string>
+    <key>MetalCaptureEnabled</key>
+    <true/>
+    <key>GCSupportsControllerUserInteraction</key>
+    <true/>
+    <key>GCSupportsGameControllerFramework</key>
+    <true/>
+    <key>NSGameControllers</key>
+    <array>
+        <string>Extended</string>
+        <string>DualSense</string>
+        <string>Xbox</string>
+    </array>
+    <key>NSGameMode</key>
+    <dict>
+        <key>OnLaunch</key>
+        <string>Active</string>
+    </dict>
 </dict>
 </plist>
 EOF
+
+# Codesign the bundle.
+#
+# Local development: MQ_SIGN_IDENTITY unset → ad-hoc signing ("-"), which
+#                    Gatekeeper accepts on the same machine.
+# Distribution:      export MQ_SIGN_IDENTITY="Developer ID Application: You (TEAMID)"
+#                    before running this script. The output bundle is then
+#                    ready for notarization:
+#
+#   ditto -c -k --keepParent build/Quake.app build/Quake.zip
+#   xcrun notarytool submit build/Quake.zip \
+#         --apple-id you@example.com --team-id TEAMID \
+#         --password @keychain:AC_PASSWORD --wait
+#   xcrun stapler staple build/Quake.app
+#
+# --options runtime is required by the notary service.
+SIGN_IDENTITY="${MQ_SIGN_IDENTITY:--}"
+if command -v codesign >/dev/null 2>&1; then
+    codesign --force --deep --sign "$SIGN_IDENTITY" \
+             --options runtime \
+             build/Quake.app 2>/dev/null || \
+        echo "Warning: codesign with identity '$SIGN_IDENTITY' failed (continuing anyway)"
+fi
 
 echo "Build complete! Binary: build/Quake.app"
 echo "Note: Ensure id1/pak0.pak is available for testing. Run with: open build/Quake.app"

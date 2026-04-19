@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <mach/mach_time.h>
 #include "quakedef.h"
+#include "Metal_Settings.h"
 
 @interface QuakeAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
 @property(nonatomic, assign) BOOL shouldKeepRunning;
@@ -106,11 +107,14 @@ void Sys_RegisterWindow(NSWindow *window) {
 void* Sys_CreateWindow(int width, int height, void* pDevice) {
   id<MTLDevice> device = (__bridge id<MTLDevice>)pDevice;
   NSRect frame = NSMakeRect(0, 0, width, height);
+  // Resizable mask is required so NSWindow.toggleFullScreen: works.
+  // Without it the OS refuses to enter native-fullscreen mode.
   NSWindow* window = [[NSWindow alloc] initWithContentRect:frame
-                                                 styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable
+                                                 styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
                                                    backing:NSBackingStoreBuffered
                                                      defer:NO];
-  [window setTitle:@"Quake Modern (Metal)"];
+  [window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
+  [window setTitle:@"Quake (Metal)"];
   
   g_mtkView = [[MTKView alloc] initWithFrame:frame device:device];
   g_mtkView.colorPixelFormat = MTLPixelFormatBGRA8Unorm; // Must match MetalFX scaler output format
@@ -119,6 +123,9 @@ void* Sys_CreateWindow(int width, int height, void* pDevice) {
   g_mtkView.enableSetNeedsDisplay = NO;
   
   if ([g_mtkView.layer isKindOfClass:[CAMetalLayer class]]) {
+      // VSync is off by default so the game can run uncapped above
+      // display refresh. Users can flip it via `vid_vsync 1` in the
+      // console (Sys_SetVsync below is called by the cvar callback).
       ((CAMetalLayer*)g_mtkView.layer).displaySyncEnabled = NO;
   }
   
@@ -140,6 +147,30 @@ void* Sys_CreateWindow(int width, int height, void* pDevice) {
 void* Sys_GetNextDrawable(void* layer) {
   CAMetalLayer* metalLayer = (__bridge CAMetalLayer*)layer;
   return (__bridge void*)[metalLayer nextDrawable];
+}
+
+// Called from vid_metal.cpp when vid_fullscreen cvar changes. Metal
+// handles true-fullscreen via -[NSWindow toggleFullScreen:]; we defer
+// to the main thread so it's safe from the render thread.
+void Sys_SetFullscreen(int on) {
+    if (!gameWindow) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        bool isFS = ([gameWindow styleMask] & NSWindowStyleMaskFullScreen) != 0;
+        if ((on && !isFS) || (!on && isFS)) {
+            [gameWindow toggleFullScreen:nil];
+        }
+    });
+}
+
+// Called from vid_metal.cpp when the vid_vsync cvar changes. Toggling
+// displaySyncEnabled is cheap and takes effect on the next present.
+void Sys_SetVsync(int enabled) {
+    if (!g_mtkView) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if ([g_mtkView.layer isKindOfClass:[CAMetalLayer class]]) {
+            ((CAMetalLayer*)g_mtkView.layer).displaySyncEnabled = enabled ? YES : NO;
+        }
+    });
 }
 
 void Sys_SetWindowSize(int width, int height) {
@@ -210,9 +241,27 @@ double Sys_FloatTime(void) {
   return (double)(now - start) * (double)info.numer / (double)info.denom / 1e9;
 }
 
+// Sys_ConsoleInput was for dedicated-server stdin polling on DOS/Linux;
+// on macOS we don't ship a headless console, so it stays a no-op.
 char *Sys_ConsoleInput(void) { return NULL; }
-void Sys_Sleep(void) {}
+
+// The original Sys_Sleep was a DOS/Windows single-tick yield. Our main
+// loop runs as fast as the display will let it; giving the scheduler a
+// tiny hint when the game isn't the foreground window reduces CPU churn
+// without hurting gameplay perceptibly.
+void Sys_Sleep(void) {
+    if (!gameWindow || ![NSApp isActive]) {
+        usleep(1000); // 1ms — yields to other apps while backgrounded.
+    }
+}
+
+// Event dispatch happens inside the main() @autoreleasepool loop via
+// nextEventMatchingMask, so these are intentional no-ops. Kept for the
+// engine's driver contract.
 void Sys_SendKeyEvents(void) {}
+
+// x87-era FPU precision hooks. arm64 has no precision control word, so
+// these do nothing and always will.
 void Sys_LowFPPrecision(void) {}
 void Sys_HighFPPrecision(void) {}
 void Sys_SetFPCW(void) {}
@@ -313,23 +362,42 @@ int main(int argc, char **argv) {
     parms.memsize = 256 * 1024 * 1024;  // 256MB — Apple Silicon unified memory
     parms.membase = malloc(parms.memsize);
 
+    // Initialize settings struct to hardware-appropriate defaults, then
+    // overlay persisted values from disk before Host_Init reads them.
+    extern void MQ_InitSettings(void);
+    extern void MQ_LoadSettings(const char* path);
+    MQ_InitSettings();
+    MQ_LoadSettings("id1/metal_quake.cfg");
+
     Host_Init(&parms);
-    
+
     // Initialize GCD multicore task system
     extern void MQ_TasksInit(void);
     MQ_TasksInit();
-    
+
     // Initialize PHASE spatial audio engine (dual-engine alongside Core Audio)
     extern void MQ_PHASE_Init(void);
     MQ_PHASE_Init();
-    
+
     // Initialize CoreML neural pipeline (graceful skip if no models)
     extern void MQ_CoreML_Init(id device);
     MQ_CoreML_Init(MTLCreateSystemDefaultDevice());
-    
-    // Sync settings from UserDefaults (launcher persistence) on startup
+
+    // Subscribe to MetricKit diagnostics so crashes/hangs that happened
+    // in the prior session land as JSON payloads in
+    // ~/Library/Application Support/MetalQuake/ on the next launch.
+    extern void MQ_MetricKit_Init(void);
+    MQ_MetricKit_Init();
+
+    // Sync settings from UserDefaults (launcher persistence) on startup —
+    // this runs after MQ_LoadSettings so SwiftUI @AppStorage takes precedence
+    // when both exist (matches user expectation: the launcher is the UI).
     extern void MQBridge_SyncSettings(void);
     MQBridge_SyncSettings();
+
+    // Apply loaded settings to live cvars.
+    extern void MQ_ApplySettings(void);
+    MQ_ApplySettings();
     
     // Enable mouse look by default and hide cursor
     extern void Cbuf_AddText(char *text);
@@ -352,11 +420,17 @@ int main(int argc, char **argv) {
         oldtime = newtime;
         if (time > 0.2) time = 0.2;
 
+        // Per-event autoreleasepool: high-rate mouse events can generate
+        // hundreds of autorelease objects per frame; draining per-event
+        // keeps peak memory flat instead of accumulating until Host_Frame.
         NSEvent *event;
-        while ((event = [app nextEventMatchingMask:NSEventMaskAny
-                                         untilDate:[NSDate distantPast]
-                                            inMode:NSDefaultRunLoopMode
-                                           dequeue:YES])) {
+        while (1) {
+          @autoreleasepool {
+            event = [app nextEventMatchingMask:NSEventMaskAny
+                                     untilDate:[NSDate distantPast]
+                                        inMode:NSDefaultRunLoopMode
+                                       dequeue:YES];
+            if (!event) break;
           switch ([event type]) {
             case NSEventTypeKeyDown: {
               int k = MapKey([event keyCode]);
@@ -397,6 +471,28 @@ int main(int argc, char **argv) {
               if (MQBridge_IsLauncherVisible()) { [app sendEvent:event]; break; }
               int k = MapKey([event keyCode]);
               if (k) Key_Event(k, false);
+              break;
+            }
+            case NSEventTypeFlagsChanged: {
+              // macOS delivers Shift / Ctrl / Option / Command through
+              // this event type — NOT as KeyDown/KeyUp — so we translate
+              // modifier bitmask transitions to Quake Key_Event() so
+              // the console's shift-map (e.g. '-' → '_') works.
+              extern int MQBridge_IsLauncherVisible(void);
+              if (MQBridge_IsLauncherVisible()) { [app sendEvent:event]; break; }
+              NSEventModifierFlags f = [event modifierFlags];
+              static NSEventModifierFlags _lastFlags = 0;
+              NSEventModifierFlags changed = f ^ _lastFlags;
+              if (changed & NSEventModifierFlagShift) {
+                Key_Event(K_SHIFT, (f & NSEventModifierFlagShift) ? 1 : 0);
+              }
+              if (changed & NSEventModifierFlagControl) {
+                Key_Event(K_CTRL, (f & NSEventModifierFlagControl) ? 1 : 0);
+              }
+              if (changed & NSEventModifierFlagOption) {
+                Key_Event(K_ALT, (f & NSEventModifierFlagOption) ? 1 : 0);
+              }
+              _lastFlags = f;
               break;
             }
             case NSEventTypeLeftMouseDown:
@@ -451,20 +547,33 @@ int main(int argc, char **argv) {
                 [app sendEvent:event];
                 break;
               }
-              // Use CGEvent deltas for smooth, raw mouse input
               extern keydest_t key_dest;
               if (gameWindow && [gameWindow isKeyWindow] && key_dest == key_game) {
-                CGEventRef cgEvent = [event CGEvent];
-                double dx = CGEventGetDoubleValueField(cgEvent, kCGMouseEventDeltaX);
-                double dy = CGEventGetDoubleValueField(cgEvent, kCGMouseEventDeltaY);
-                mouse_x += dx;
-                mouse_y += dy;
+                // Branch on the raw_mouse setting: when on (default), use
+                // CGEvent deltas which bypass macOS acceleration and give
+                // consistent per-pixel movement. When off, use NSEvent's
+                // deltaX/deltaY which respect the system's mouse curve —
+                // useful for users who want their OS-level acceleration
+                // applied in-game too.
+                extern MetalQuakeSettings* MQ_GetSettings(void);
+                MetalQuakeSettings *mqs = MQ_GetSettings();
+                if (!mqs || mqs->raw_mouse) {
+                  CGEventRef cgEvent = [event CGEvent];
+                  double dx = CGEventGetDoubleValueField(cgEvent, kCGMouseEventDeltaX);
+                  double dy = CGEventGetDoubleValueField(cgEvent, kCGMouseEventDeltaY);
+                  mouse_x += dx;
+                  mouse_y += dy;
+                } else {
+                  mouse_x += (float)[event deltaX];
+                  mouse_y += (float)[event deltaY];
+                }
               }
               break;
             }
             default:
               [app sendEvent:event];
               break;
+          }
           }
         }
 
@@ -504,10 +613,42 @@ int main(int argc, char **argv) {
         }
 
         Host_Frame(time);
+
+        // Refresh window title at most twice a second with current map +
+        // smoothed FPS. Skips during menu/launcher states so the title
+        // doesn't flicker while the user is mid-click.
+        {
+          static double _lastTitleUpdate = 0;
+          if (newtime - _lastTitleUpdate > 0.5 && gameWindow) {
+            _lastTitleUpdate = newtime;
+            extern float MQBridge_GetFPS(void);
+            extern const char* MQBridge_GetCurrentMap(void);
+            const char *mapName = MQBridge_GetCurrentMap();
+            float fps = MQBridge_GetFPS();
+            NSString *title;
+            if (mapName && mapName[0]) {
+              const char *base = strrchr(mapName, '/');
+              base = base ? base + 1 : mapName;
+              title = [NSString stringWithFormat:@"Quake (Metal) — %s — %.0f fps",
+                                                   base, fps];
+            } else {
+              title = [NSString stringWithFormat:@"Quake (Metal) — %.0f fps", fps];
+            }
+            [gameWindow setTitle:title];
+          }
+        }
       }
     }
 
     CGDisplayShowCursor(kCGDirectMainDisplay);
+
+    // Persist current settings before Host_Shutdown — Host_Shutdown will
+    // tear down the filesystem and zone allocator, making further I/O
+    // unsafe. The launcher's @AppStorage is written by the SwiftUI side;
+    // this ensures the engine-authoritative cvars also round-trip to disk.
+    extern void MQ_SaveSettings(const char* path);
+    MQ_SaveSettings("id1/metal_quake.cfg");
+
     Host_Shutdown();
   }
   return 0;

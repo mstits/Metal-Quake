@@ -969,8 +969,11 @@ if (cl.onground && ent->origin[2] - oldz > 0)
 	float steptime;
 	
 	steptime = cl.time - cl.oldtime;
+	// Demo playback and server pauses legitimately roll cl.time backwards,
+	// so a negative steptime is NOT an error — it just means no ground
+	// tracking this frame. The old I_Error would kill the process on any
+	// demo rewind; silently clamping keeps the view stable.
 	if (steptime < 0)
-//FIXME		I_Error ("steptime < 0");
 		steptime = 0;
 
 	oldz += steptime * 80;

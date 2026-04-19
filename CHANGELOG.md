@@ -4,10 +4,70 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### In Progress
+### Added
 
-- Mesh shader BSP pipeline activation (M3+ meshlet generation).
-- `UDP_Read` async-to-sync bridge in `net_apple.cpp`.
+- **BLAS refit path** — when the frame's triangle count matches the previous frame's, the per-frame BLAS update now uses `refitAccelerationStructure` instead of rebuilding from scratch. 3–5× faster on Apple Silicon for stable-topology frames.
+- **CoreML `MLModel` load at init** — `MQ_Denoiser.mlmodelc` / `MQ_RealESRGAN.mlmodelc` are loaded with `MLComputeUnitsAll` so they'll run on the ANE when a trained model is dropped in; falls back to the MPS placeholders otherwise.
+- **`vid_vsync`** cvar (0=uncapped, 1=display sync). Hot-applied via `CAMetalLayer.displaySyncEnabled` on the main thread.
+- **`vid_fullscreen`** cvar. Flips the window through `-[NSWindow toggleFullScreen:]`; the collection behavior is set to `NSWindowCollectionBehaviorFullScreenPrimary` at window creation.
+- **`MQBridge_ToggleCvar`** for the launcher to flip bool cvars atomically without relying on a legacy `toggle` console command.
+- **Launcher header bar** gains **Screenshot** and **Fullscreen** buttons.
+- **Launcher Settings bottom bar** gains **Reset Defaults** — mirrors `MQ_InitSettings`' values on the Swift side.
+- **GPU command / encoder labels** (`MQ.RT+Compose`, `RT.Raytrace`, `SVGF.Reproject`, `SVGF.Variance`, `Denoise.Atrous`, `BLAS Build`/`BLAS Refit`) so Instruments and the Metal Debugger group work under readable names.
+- **SVGF full variance-guided path** — separate `svgfVariance` compute kernel + RG16Float moments + R16Float variance textures. `r_svgf 2` enables the variance-aware bilateral modulation; `r_svgf 1` keeps the older reprojection-only path.
+- **MetalFX Frame Interpolation** fully wired through `MQ_FrameInterp.m` (an ObjC shim that imports `<MetalFX/MetalFX.h>`). Creates a real `MTLFXFrameInterpolator`, encodes a synthesized middle frame between each render, blits the result back into a prev-frame history texture. Gated behind `r_frameinterp`.
+- **MTLResidencySet** (macOS 15+) via `MQ_Residency.m` — texture atlas and meshlet buffer are pinned as resident across frames.
+- **RT water refraction** — Snell's-law refracted secondary ray samples underwater geometry with depth-attenuated fog; Fresnel Schlick mixes reflection vs refraction.
+- **Underwater volumetric fog** when the listener is submerged, with hash-noise density, distinct from the open-air fog curve.
+- **Alpha-cutout atlas encoding** — palette index 255 now writes alpha=0 so transparent texels are distinguishable to the RT path.
+- **In-game FPS overlay** via new `showfps` cvar; top-right corner, 0.25s smoothing window.
+- **`mq_info` + `dumpcvars` console commands** — report hardware / feature state and list every registered cvar.
+- **SharePlay Group Activity** (`QuakeGroupActivity`) with engine-side observer that auto-issues `connect <addr>` on incoming session joins; Multiplayer tab now has a **Share via FaceTime** button alongside **Scan LAN**.
+- **Game Center auth UI** now presents the sign-in view controller as a sheet on the game window instead of logging "UI needed" and bailing.
+- **MetricKit diagnostic subscriber** — crash / hang payloads write to `~/Library/Application Support/MetalQuake/` as JSON on the next launch.
+- **Launcher hot-reload** — FOV, gamma, HUD scale, SFX/music volumes, sensitivity, deadzone, rumble intensity, invert-Y, raw-mouse all re-sync cvars as sliders move, not just on Apply.
+- **Minimal test harness** (`tests/run.sh`) with two passing tests that covers settings round-trip (caught a real parser bug) and UDP address compare semantics.
+- **Distribution pipeline docs** — `build.sh` now honors `MQ_SIGN_IDENTITY`, ships `--options runtime`, and the inline comment block documents the full `notarytool` + `stapler` flow.
+
+### Fixed
+
+- **Settings parser dropped every field** — the loader's `fscanf("%63s %f")` aborted on the first `//` comment line in the saved config, so loads silently fell back to defaults. Switched to line-by-line `fgets` with comment skipping.
+- **Video Options menu label overlap** — `Chr. Aberration:` and `Underwater FX:` ran past the ON/OFF value column. Shortened to `Chroma AB:` / `Water FX:` and `Liquid Glass:` → `Glass HUD:`.
+- **Bilateral denoiser "plastic wrap" look** — pass count cut from 3 to 2 (dropped the step-width-4 pass that was bleeding across pixel-art texel boundaries) and `sigmaColor` tightened from 0.1 to 0.035.
+- **`MQ_ApplySettings` silently forced `neural_denoise` on** when `rt_quality >= HIGH`; now leaves the user's choice alone.
+- **SharePlay class lookup failed** at runtime — added `@objc(MQSharePlayManager)` pinning so `NSClassFromString` resolves.
+- **RT bias self-shadowing small geometry** — shadow-ray bias scales with hit distance now.
+- **Core Audio ring buffer race** — added per-operation memory_order_acquire/release fences; introduced `framesConsumed` atomic so `SNDDMA_GetDMAPos` reports the right DMA index.
+
+---
+
+## [1.3.0] — 2026-04-19
+
+### Fixed
+
+- **Dead CoreML module**. `MPSGraph` executables were declared but never compiled, so `MQ_CoreML_Denoise` / `MQ_CoreML_UpscaleTexture` early-returned `-1` on every call — the whole module was inert. Rewritten to use `MPSImageGaussianBlur` for the per-frame denoiser (GPU-native, no CPU round-trip) and an honest `MPSGraph resizeBilinear` for the upscaler.
+- **Settings never persisted**. `MQ_SaveSettings` / `MQ_LoadSettings` existed but had no callers. Now invoked from `sys_macos.m` at Host_Init / before Host_Shutdown, covering all 28 struct fields instead of 16. Forward-compatible (unknown keys silently skipped on load).
+- **PHASE BSP occlusion**. Function body was a comment-only stub. Now triangulates `cl.worldmodel->surfaces` into an `MDLMesh`, builds a `PHASEShape` + `PHASEOccluder`, and logs the tri/vert count per map.
+- **Net driver sender address**. `StartReceiving` wrote a zeroed `qsockaddr` for every inbound packet, making peers indistinguishable. Now extracts hostname/port via `nw_endpoint_get_hostname` + `nw_endpoint_get_port`.
+- **`UDP_CheckNewConnections`** permanently returned `-1`; now dequeues from a `PushPendingConnection` ring populated by the `nw_listener` handler.
+- **`UDP_OpenSocket`** returned a virtual index with no binding; now sets a local endpoint on the connection parameters.
+- **`_blasEvent` leak** — static-inside-function allocated one `MTLSharedEvent` per process and never released. Moved to module scope and released in `VID_Shutdown`.
+- **Per-frame BLAS buffer churn**. `_pRTVertexBuffer` / `_pRTIndexBuffer` were `release()`'d and re-`newBuffer()`'d every frame. Now grow-only with `memcpy` into shared storage.
+- **`SNDDMA_GetDMAPos` unit mismatch**. Was returning the proxy ring-buffer's head modulo `sn.samples`, but the ring buffer is a different size than `sn.buffer`. Added a monotonic `framesConsumed` atomic that's scaled into `sn.samples`-space correctly.
+- **ARC missing on `.m` files**. `build.sh` passed `-fobjc-arc` in `CXXFLAGS` only; Objective-C files compiled without ARC while using ARC idioms. Now `OBJCFLAGS` applies `-fobjc-arc` to `.m` files specifically.
+- **`Info.plist` minimal**. Added `CFBundleShortVersionString`, `CFBundleVersion`, `LSMinimumSystemVersion`, `NSHumanReadableCopyright`, controller metadata, `NSSupportsAutomaticGraphicsSwitching`, and an ad-hoc codesign step.
+- **`CMakeLists.txt` out of sync**. Missing six modern `src/macos/` sources; no MPS/PHASE framework links. Synced with `build.sh`.
+- **Event-pump autorelease pressure**. Moved the `@autoreleasepool` to wrap each inner event-dequeue iteration so high-rate mouse events drain per-event instead of per-frame.
+
+### Added
+
+- **Weapon-aware adaptive triggers** (DualSense). On weapon-switch edge, right-trigger mode reprograms to match the weapon's feel (Axe=off, SSG=heavy break, Nailgun=vibration, Rocket=max resistance, etc.) rather than a fixed global profile.
+- **Gyro aim** via `GCMotion`. `joy_gyro_enabled` / `joy_gyro_yaw` / `joy_gyro_pitch` cvars. Additive on top of stick aim.
+- **Controller battery warnings**. `GCDeviceBattery` poll, throttled to once per minute, fires below 15% when not charging.
+- **PHASE environment model swap**. Listener leaf `contents` (water / slime / lava / air) drives the `PHASEGeometricSpreadingDistanceModelParameters` cull distance.
+- **Mesh-shader LOD uniforms** (`lodNearDistance`, `lodFarDistance`). Beyond the near threshold, object shader emits every *k*-th triangle up to a 4× reduction.
+- **SVGF temporal reprojection** behind `r_svgf`. History texture + compute kernel that warps previous denoised output through current motion vectors and blends with current frame. Disabled by default; foundation for full SVGF.
+- **Frame Interpolation probe** (`r_frameinterp` cvar + `objc_getClass("MTLFXFrameInterpolator")` at VID_Init). Detection only; encode wiring pending.
 
 ---
 

@@ -465,6 +465,20 @@ void S_StartSound(int entnum, int entchannel, sfx_t *sfx, vec3_t origin, float f
 	if (nosound.value)
 		return;
 
+	// Accessibility subtitles — when the user has the Subtitles setting
+	// on, print each sound event's filename to the console so deaf/hoh
+	// players can see what they just heard. The engine has no real
+	// caption table, so we surface the raw path (e.g. "zombie/z_hit.wav")
+	// which is descriptive enough for pickups, monster barks, and gunfire.
+	// Forward-declares a getter rather than pulling Metal_Settings.h
+	// into the 1996-era C file.
+	{
+		extern int MQ_Subtitles_Enabled(void);
+		if (sfx && sfx->name[0] && MQ_Subtitles_Enabled()) {
+			Con_Printf("[sfx] %s\n", sfx->name);
+		}
+	}
+
 	vol = fvol*255;
 
 // pick a channel to play on

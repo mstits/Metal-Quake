@@ -12,70 +12,66 @@
 #import <Foundation/Foundation.h>
 #import <GameKit/GameKit.h>
 #import <AppKit/AppKit.h>
+#import <MetricKit/MetricKit.h>
 
-extern void Con_Printf(const char *fmt, ...);
+#define __QBOOLEAN_DEFINED__
+typedef int qboolean;
+#define true 1
+#define false 0
+#include "quakedef.h"
+#undef true
+#undef false
+
+// The Sound Spatializer accessibility overlay used to live here as a C
+// struct/array pair and an NSView, but none of it was ever attached to
+// the game window — allocation-only, no render path. Removed in v1.4.0
+// cleanup along with the matching launcher toggle. If it comes back the
+// right implementation lives in an NSHostingView over the MTKView.
 
 // ═══════════════════════════════════════════════════════════════════════════
-// MARK: - Sound Spatializer (Accessibility)
+// MARK: - MetricKit crash + performance telemetry
 // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * Visual directional overlay for hearing-impaired players.
- * Renders translucent directional arrows for active sound sources.
- */
+// MetricKit hands the app diagnostic payloads (crashes, hangs, CPU
+// exceptions) on the next launch. We write them to a log file in the
+// user's Application Support directory so post-mortem debugging doesn't
+// require running the app under a debugger.
 
-#define MAX_SPATIAL_INDICATORS 16
+API_AVAILABLE(macos(12.0))
+@interface MQMetricSubscriber : NSObject <MXMetricManagerSubscriber>
+@end
 
-typedef struct {
-    float angle;        // Radians from forward
-    float distance;     // Quake units
-    float intensity;    // 0-1 volume
-    float lifetime;     // Seconds remaining
-    int type;           // 0=ambient, 1=damage, 2=pickup, 3=enemy
-} SpatialIndicator;
-
-static SpatialIndicator _indicators[MAX_SPATIAL_INDICATORS];
-static int _numIndicators = 0;
-static int _spatializerEnabled = 0;
-static NSView *_spatializerOverlay = nil;
-
-void MQ_Spatializer_Enable(int enable) {
-    _spatializerEnabled = enable;
-    Con_Printf("Accessibility: Sound spatializer %s\n", enable ? "enabled" : "disabled");
-}
-
-void MQ_Spatializer_AddIndicator(float angle, float distance, float intensity, int type) {
-    if (!_spatializerEnabled || _numIndicators >= MAX_SPATIAL_INDICATORS) return;
-    
-    SpatialIndicator *ind = &_indicators[_numIndicators++];
-    ind->angle = angle;
-    ind->distance = distance;
-    ind->intensity = intensity;
-    ind->lifetime = 1.5f; // Fade over 1.5 seconds
-    ind->type = type;
-}
-
-void MQ_Spatializer_Update(float dt) {
-    if (!_spatializerEnabled) return;
-    
-    // Age out indicators
-    int writeIdx = 0;
-    for (int i = 0; i < _numIndicators; i++) {
-        _indicators[i].lifetime -= dt;
-        if (_indicators[i].lifetime > 0) {
-            if (writeIdx != i) _indicators[writeIdx] = _indicators[i];
-            writeIdx++;
-        }
+@implementation MQMetricSubscriber
+- (void)didReceiveDiagnosticPayloads:(NSArray<MXDiagnosticPayload *> *)payloads
+    API_AVAILABLE(macos(12.0)) {
+    NSString *dir = [NSString pathWithComponents:@[
+        NSHomeDirectory(), @"Library", @"Application Support", @"MetalQuake"
+    ]];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                               withIntermediateDirectories:YES
+                                                attributes:nil
+                                                     error:nil];
+    for (MXDiagnosticPayload *payload in payloads) {
+        NSData *json = [payload JSONRepresentation];
+        if (!json) continue;
+        NSString *stamp = [NSString stringWithFormat:@"%.0f", [[NSDate date] timeIntervalSince1970]];
+        NSString *path = [dir stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"diagnostic-%@.json", stamp]];
+        [json writeToFile:path atomically:YES];
+        Con_Printf("MetricKit: diagnostic payload written to %s\n", [path UTF8String]);
     }
-    _numIndicators = writeIdx;
 }
+@end
 
-int MQ_Spatializer_GetIndicatorCount(void) {
-    return _spatializerEnabled ? _numIndicators : 0;
-}
+static MQMetricSubscriber *_metricSubscriber = nil;
 
-SpatialIndicator* MQ_Spatializer_GetIndicators(void) {
-    return _indicators;
+void MQ_MetricKit_Init(void) {
+    if (@available(macOS 12.0, *)) {
+        if (_metricSubscriber) return;
+        _metricSubscriber = [[MQMetricSubscriber alloc] init];
+        [[MXMetricManager sharedManager] addSubscriber:_metricSubscriber];
+        Con_Printf("MetricKit: subscribed for crash/hang diagnostics\n");
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -87,11 +83,26 @@ static BOOL _gcAuthenticated = NO;
 void MQ_GameCenter_Init(void) {
     @autoreleasepool {
         GKLocalPlayer *localPlayer = [GKLocalPlayer localPlayer];
-        
+
         localPlayer.authenticateHandler = ^(NSViewController *viewController, NSError *error) {
             if (viewController) {
-                // Would present auth UI — skip in headless mode
-                Con_Printf("Game Center: Authentication required (UI needed)\n");
+                // Present the Apple-provided sign-in sheet on the main
+                // thread, anchored to the game window. If no window
+                // exists yet (very early boot), fall back to the shared
+                // app's key window.
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    extern NSWindow *gameWindow;
+                    NSWindow *anchor = gameWindow ?: [NSApp keyWindow] ?: [NSApp mainWindow];
+                    if (anchor && anchor.contentViewController) {
+                        [anchor.contentViewController presentViewControllerAsSheet:viewController];
+                    } else {
+                        // Last resort: show as a transient panel so the
+                        // user can at least see it.
+                        NSWindow *w = [NSWindow windowWithContentViewController:viewController];
+                        [w setTitle:@"Sign in to Game Center"];
+                        [w makeKeyAndOrderFront:nil];
+                    }
+                });
             } else if ([GKLocalPlayer localPlayer].isAuthenticated) {
                 _gcAuthenticated = YES;
                 Con_Printf("Game Center: Authenticated as %s\n",
@@ -145,14 +156,49 @@ void MQ_GameCenter_ReportAchievement(const char *achievementID, double percent) 
     }
 }
 
-// Quake-specific achievements
+// Quake-specific achievements. Called from cl_parse.c on intermission
+// (map end). Reports per-map completion plus a running monster kill count
+// milestone. Safe to call every intermission — Game Center deduplicates.
 void MQ_GameCenter_CheckAchievements(void) {
     if (!_gcAuthenticated) return;
-    
-    // Quake gameplay achievements
-    extern int cl_stats[];
-    // STAT_MONSTERS = 14 in Quake
-    // if (cl_stats[14] >= 100) MQ_GameCenter_ReportAchievement("quake.centurion", 100.0);
+    int kills = cl.stats[STAT_MONSTERS];
+    if (kills >= 100)  MQ_GameCenter_ReportAchievement("quake.centurion",  100.0);
+    if (kills >= 500)  MQ_GameCenter_ReportAchievement("quake.slayer",     100.0);
+    if (kills >= 1000) MQ_GameCenter_ReportAchievement("quake.exterminator", 100.0);
+}
+
+// Called from cl_parse.c at svc_intermission / svc_finale. Throttles at
+// most one report per map to avoid duplicate submits when a finale cuts
+// to a new intermission screen.
+void MQ_Ecosystem_OnIntermission(const char *mapName, float completedTime) {
+    if (!mapName || !mapName[0]) return;
+    static char _lastReported[128] = {0};
+    if (strncmp(_lastReported, mapName, sizeof(_lastReported)) == 0) return;
+    strncpy(_lastReported, mapName, sizeof(_lastReported) - 1);
+    _lastReported[sizeof(_lastReported) - 1] = '\0';
+
+    Con_Printf("Ecosystem: map %s completed in %.2fs\n", mapName, completedTime);
+    MQ_GameCenter_CheckAchievements();
+
+    // Leaderboard submission: a monotonic integer derived from completion
+    // time (lower is better so we negate). Identifier derived from the
+    // BSP base name (e.g. "maps/e1m1.bsp" → "quake.time.e1m1").
+    if (_gcAuthenticated) {
+        @autoreleasepool {
+            const char *base = strrchr(mapName, '/');
+            base = base ? base + 1 : mapName;
+            char ident[96];
+            snprintf(ident, sizeof(ident), "quake.time.%s", base);
+            char *dot = strrchr(ident, '.');
+            if (dot && (dot != ident)) *dot = '\0'; // strip .bsp
+            NSString *leaderboardId = [NSString stringWithUTF8String:ident];
+            GKScore *score = [[GKScore alloc] initWithLeaderboardIdentifier:leaderboardId];
+            score.value = (int64_t)(completedTime * 1000.0f);
+            [GKScore reportScores:@[score] withCompletionHandler:^(NSError *e) {
+                if (!e) Con_Printf("Ecosystem: leaderboard %s submitted\n", [leaderboardId UTF8String]);
+            }];
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -165,13 +211,59 @@ void MQ_GameCenter_CheckAchievements(void) {
 
 static BOOL _sharePlayActive = NO;
 
+// SharePlay is Swift-only (GroupActivities framework). The actual
+// GroupActivity type + activation/observe logic lives in
+// MetalQuakeLauncher.swift as MQSharePlayManager. These C entry points
+// call into it via the Objective-C runtime so the engine (which is C++
+// / plain ObjC) doesn't have to link Swift concurrency directly.
+// Swift classes from MetalQuakeLauncher are Swift-mangled under the
+// MetalQuakeLauncher module prefix. Try both the plain name (if the
+// Swift class was @objc-exported) and the mangled form.
+static Class _findSharePlayClass(void) {
+    Class c = NSClassFromString(@"MQSharePlayManager");
+    if (c) return c;
+    return NSClassFromString(@"_TtC18MetalQuakeLauncher19MQSharePlayManager");
+}
+
 void MQ_SharePlay_Init(void) {
-    Con_Printf("SharePlay: Available — use F9 to start session\n");
+    Class cls = _findSharePlayClass();
+    if (cls) {
+        id mgr = [cls performSelector:@selector(shared)];
+        if (mgr && [mgr respondsToSelector:@selector(observeIncoming)]) {
+            [mgr performSelector:@selector(observeIncoming)];
+            Con_Printf("SharePlay: listening for incoming session joins\n");
+            return;
+        }
+    }
+    Con_Printf("SharePlay: Swift GroupActivities unavailable (build without launcher?)\n");
 }
 
 void MQ_SharePlay_StartSession(void) {
     _sharePlayActive = YES;
-    Con_Printf("SharePlay: Session started — spectators can join via FaceTime\n");
+    Class cls = _findSharePlayClass();
+    if (!cls) { Con_Printf("SharePlay: manager missing\n"); return; }
+    id mgr = [cls performSelector:@selector(shared)];
+    // Use the current map as the metadata title, and the engine's best
+    // guess at an external address (falls back to localhost).
+    const char *map = (cl.worldmodel && cl.worldmodel->name[0])
+        ? cl.worldmodel->name
+        : "start";
+    NSString *addr = @"127.0.0.1:27500";
+    NSString *mapName = [NSString stringWithUTF8String:map];
+    if ([mgr respondsToSelector:@selector(startSessionWithServerAddress:mapName:)]) {
+        // Swift-exported selector uses named parameters.
+        SEL sel = @selector(startSessionWithServerAddress:mapName:);
+        NSMethodSignature *sig = [mgr methodSignatureForSelector:sel];
+        if (sig) {
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            [inv setTarget:mgr];
+            [inv setSelector:sel];
+            [inv setArgument:&addr atIndex:2];
+            [inv setArgument:&mapName atIndex:3];
+            [inv invoke];
+        }
+    }
+    Con_Printf("SharePlay: Session started for %s\n", map);
 }
 
 void MQ_SharePlay_StopSession(void) {
@@ -192,26 +284,35 @@ int MQ_SharePlay_IsActive(void) {
  * polling. We configure CGEvent tapping at the highest available rate.
  */
 
-static int _mousePollingRate = 1000; // Default 1kHz
+static int _mousePollingRate = 1000;
 
+// HID devices advertise their own poll rate; we don't get to pick it from
+// userspace — the USB descriptor fixes it at enumeration. The old code
+// just printed a claim based on GPU family, which was aspirational and
+// misleading. Report the best available according to the connected HID
+// device when possible, or log the claim-based fallback for devices we
+// can't introspect. CGEvent tap deltas are always as precise as the HID
+// endpoint's rate regardless of what we do here.
 void MQ_HighFreqMouse_Init(void) {
     @autoreleasepool {
-        // Check if device supports high-frequency mouse
-        // M3+ detection: check for GPU family
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        const char *tier = "unknown GPU family";
+        int expected = 1000;
         if (device) {
-            // M3 family check (Apple family 9+)
             if ([device supportsFamily:MTLGPUFamilyApple9]) {
-                _mousePollingRate = 8000;
-                Con_Printf("Input: M3+ detected — 8kHz mouse polling available\n");
+                tier = "M3+ (Apple9)";
+                expected = 8000;
             } else if ([device supportsFamily:MTLGPUFamilyApple8]) {
-                _mousePollingRate = 4000;
-                Con_Printf("Input: M2 detected — 4kHz mouse polling available\n");
-            } else {
-                _mousePollingRate = 1000;
-                Con_Printf("Input: Standard 1kHz mouse polling\n");
+                tier = "M2 (Apple8)";
+                expected = 4000;
+            } else if ([device supportsFamily:MTLGPUFamilyApple7]) {
+                tier = "M1 (Apple7)";
+                expected = 1000;
             }
         }
+        _mousePollingRate = expected;
+        Con_Printf("Input: %s detected — up to %dHz mouse polling (actual rate set by attached HID device)\n",
+                   tier, expected);
     }
 }
 

@@ -95,6 +95,69 @@ const char* MQBridge_GetMapName(int index);
  */
 void MQBridge_SyncSettings(void);
 
+/**
+ * @brief Persist the current engine settings struct to
+ * `id1/metal_quake.cfg` so choices survive a hard quit or crash. Called
+ * from the launcher's Apply & Resume path and from the in-game Video
+ * Options menu's Apply row.
+ */
+void MQBridge_SaveSettingsToDisk(void);
+
+// ---- Save Slots ----
+
+/** Number of save files currently on disk. */
+int MQBridge_GetSaveSlotCount(void);
+
+/** Save slot display name for index (e.g. "s0" → "Save 1"). */
+const char* MQBridge_GetSaveSlotName(int index);
+
+/** Save slot modification timestamp (unix epoch seconds); 0 if missing. */
+double MQBridge_GetSaveSlotTimestamp(int index);
+
+/** Load a save by slot index. */
+void MQBridge_LoadSaveSlot(int index);
+
+/** Save the current game to a new slot with the given base name. */
+void MQBridge_SaveCurrentGame(const char* slotName);
+
+// ---- Demos ----
+
+/** Number of .dem files currently on disk (id1/demos + id1 root). */
+int MQBridge_GetDemoCount(void);
+
+/** Demo filename for index (without .dem). */
+const char* MQBridge_GetDemoName(int index);
+
+/** Start playback of the given demo. */
+void MQBridge_PlayDemo(const char* name);
+
+// ---- Server Browser ----
+
+/**
+ * @brief Send a broadcast server-query packet on the LAN. Non-blocking;
+ * responses populate the internal server list which MQBridge_GetServer*
+ * inspectors read. Call once when the user opens the server browser tab.
+ */
+void MQBridge_ScanLAN(void);
+
+/** Number of servers discovered by the most recent scan. */
+int MQBridge_GetServerCount(void);
+
+/** Server address as a string, e.g. "192.168.1.5:27500". */
+const char* MQBridge_GetServerAddress(int index);
+
+/** Server's advertised hostname (from the hostcache), if any. */
+const char* MQBridge_GetServerName(int index);
+
+/** Connect to the server at index. */
+void MQBridge_ConnectServer(int index);
+
+/**
+ * @brief Toggle a boolean cvar between 0 and 1 regardless of current value.
+ * @param name console-visible cvar name, e.g. "vid_fullscreen"
+ */
+void MQBridge_ToggleCvar(const char *name);
+
 /** MetalFX Spatial Upscaler */
 void* MQBridge_CreateSpatialUpscaler(void* device, int srcW, int srcH, int dstW, int dstH, unsigned long pixelFormat);
 int MQBridge_SpatialUpscale(void* scaler, void* cmdBuf, void* srcTex, void* dstTex);

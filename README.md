@@ -20,7 +20,7 @@ This is an **active work-in-progress** that acts as a testbed for Apple platform
 - **Parallel Encoding**: The main render loop utilizes `dispatch_apply` to split the encoding of heavy GPU compute tasks (Raytracing, Denoising) and Render tasks (Compositing, UI) across multiple Apple Silicon P-cores concurrently. Thread-safe GPU synchronization is handled via `MTLSharedEvent`.
 - **Input Robustness**: Mouse look exclusively relies on raw `CGEvent` deltas and programmatic cursor warping, forcefully establishing window focus to survive system-level event hijacking (such as `Cmd+Tab` or macOS screenshot overlays).
 - **Post-Processing**: 12-stage GPU fragment shader pipeline with CRT scanlines, Liquid Glass HUD, SSAO, EDR/HDR, ACES tonemapping, depth of field, bloom, and underwater warp — all hot-toggleable from the in-game Video Options menu.
-- **Machine Learning**: Native `MPSGraph` integration provides on-device Neural Denoising and Real-ESRGAN texture upscaling without the overhead of CoreML wrapper layers.
+- **GPU Denoising**: `MPSImageGaussianBlur` (with bilateral à-trous fallback) runs entirely on the GPU against the RT output texture — no CPU round-trip. A trained Real-ESRGAN model is not yet loaded; the `MPSGraph` upscaler path currently performs bilinear 4× as a stand-in, ready to swap in trained weights without touching call sites.
 
 ---
 
@@ -39,16 +39,19 @@ Features are categorized honestly:
 | **Post-Processing** | Metal Fragment | Shipped | CRT scanlines, Liquid Glass HUD, SSAO, EDR/HDR, ACES tonemapping, DoF, bloom |
 | **Upscaling** | MetalFX | Shipped | Spatial (320→1280) + Temporal (640→1280) with Halton jitter |
 | **Legacy Audio** | Core Audio | Shipped | Lock-free ring buffer, async pull model |
-| **Spatial Audio** | PHASE | Shipped | Physically-modeled sound with BSP occlusion, raw PCM float32 conversion |
+| **Spatial Audio** | PHASE | Shipped | Physically-modeled sound with BSP triangle-mesh occluder, per-environment distance model (water/slime/lava/air), raw PCM float32 conversion |
 | **Mouse Input** | CGEvent | Shipped | Raw delta input, continuous cursor warping, robust focus survival |
 | **Keyboard** | Carbon / NSEvent | Shipped | Full key mapping |
-| **Controllers** | GameController | Shipped | DualSense + Xbox — sticks, triggers, D-pad, Weapon-Aware Adaptive Triggers |
+| **Controllers** | GameController | Shipped | DualSense + Xbox — sticks, triggers, D-pad, weapon-aware adaptive triggers (reprogrammed on weapon switch), optional gyro aim, low-battery warnings |
 | **Threading** | GCD | Shipped | `dispatch_apply` parallel command buffer encoding and BSP leaf marking |
-| **Networking** | Network.framework | Shipped | UDP driver with NWConnection/NWListener + Multipath UDP for low latency |
+| **Networking** | Network.framework | Shipped | UDP driver with NWConnection/NWListener, Multipath UDP, per-packet sender endpoint extraction, pending-connection queue for `UDP_CheckNewConnections` |
 | **UI** | SwiftUI | Shipped | NSPanel launcher overlay, full settings bridge to engine cvars |
-| **Settings Sync** | UserDefaults | Shipped | Cross-syncs `@AppStorage` values to engine variables |
-| **Machine Learning** | MPSGraph (Metal 4) | Shipped | Real-time Neural Denoising and Texture Upscaling via direct Tensor APIs |
-| **Mesh Shaders** | Metal 3.1 | Shipped | High-poly BSP clustering (BSPMeshlets) with Object-Shader frustum culling |
+| **Settings Sync** | UserDefaults | Shipped | Cross-syncs `@AppStorage` values to engine variables; all 28 struct fields round-trip to `id1/metal_quake.cfg` on engine start/stop |
+| **Temporal Denoise** | Compute | In Motion | SVGF temporal-reprojection scaffolding behind `r_svgf` cvar; variance-aware weights are the remaining SVGF half |
+| **Frame Interpolation** | MetalFX | In Motion | `MTLFXFrameInterpolator` detection via ObjC runtime at startup; `r_frameinterp` cvar wired, full encode pass pending |
+| **GPU Denoising** | MPS / MPSGraph | Shipped | `MPSImageGaussianBlur` pre-pass + bilateral à-trous fallback (GPU-only, no CPU pixel round-trip) |
+| **Neural Upscaler** | MPSGraph (Metal 4) | In Motion | Bilinear 4× stand-in compiles and runs; trained Real-ESRGAN weight load is the remaining piece |
+| **Mesh Shaders** | Metal 3.1 | Shipped | High-poly BSP clustering (BSPMeshlets) with Object-Shader frustum culling and distance-based LOD |
 | **Shader Caching** | MTLBinaryArchive | Shipped | Zero-stutter implicit caching and serialization to disk |
 | **OS Integration** | Game Mode | Shipped | Bundled `.app` with Game Mode opt-in for doubled Bluetooth polling rates |
 
@@ -125,8 +128,22 @@ open build/Quake.app
 **Requirements:**
 - Apple Silicon Mac (M1+)
 - macOS 14.0+ (Sonoma/Sequoia/Tahoe)
-- Xcode Command Line Tools
+- Xcode.app with Metal Toolchain: `xcodebuild -downloadComponent MetalToolchain`
 - `id1/pak0.pak` (user-provided — no game assets included)
+
+## New Cvars
+
+Beyond Quake's classic console variables, v1.3+ adds:
+
+| Cvar | Default | Description |
+|---|---|---|
+| `r_svgf` | 0 | Temporal reprojection denoise pre-pass on top of the bilateral à-trous |
+| `r_frameinterp` | 0 | MetalFX Frame Interpolation placeholder (probed at boot) |
+| `joy_gyro_enabled` | 0 | Add controller gyro deltas to view angles |
+| `joy_gyro_yaw` | 30.0 | Gyro yaw sensitivity (deg/sec per rad/sec) |
+| `joy_gyro_pitch` | 20.0 | Gyro pitch sensitivity |
+
+The Video Options menu exposes every toggle live in-game; the SwiftUI launcher mirrors the same state via `@AppStorage` and writes `id1/metal_quake.cfg` on Apply.
 
 > [!CAUTION]
 > This repository contains **no proprietary game assets**. You must provide your own `id1/pak0.pak`.

@@ -714,12 +714,17 @@ void _Host_Frame (float time)
 		S_Update (r_origin, vpn, vright, vup);
 		CL_DecayLights ();
 
-		// Metal Quake: update PHASE listener + spatializer
+		// Metal Quake: update PHASE listener + environment contents.
+		// MQ_Spatializer_Update was removed along with the unused
+		// accessibility overlay. Environment contents drive the PHASE
+		// distance-model swap (water/lava/air) so submerged sounds
+		// attenuate correctly.
 		{
 			extern void MQ_PHASE_UpdateListener(float origin[3], float forward[3], float right[3], float up[3]);
-			extern void MQ_Spatializer_Update(float dt);
+			extern void MQ_PHASE_UpdateListenerEnvironment(int contents);
+			extern mleaf_t *r_viewleaf;
 			MQ_PHASE_UpdateListener(r_origin, vpn, vright, vup);
-			MQ_Spatializer_Update(host_frametime);
+			if (r_viewleaf) MQ_PHASE_UpdateListenerEnvironment(r_viewleaf->contents);
 		}
 	}
 	else
@@ -888,6 +893,7 @@ void Host_Init (quakeparms_t *parms)
 
 	Con_Printf ("Exe: "__TIME__" "__DATE__"\n");
 	Con_Printf ("%4.1f megabyte heap\n",parms->memsize/ (1024*1024.0));
+	Con_Printf ("Metal Quake 1.4.x — type `mq_info` for hardware + feature detail\n");
 	
 	R_InitTextures ();		// needed even for dedicated servers
  
@@ -914,11 +920,11 @@ void Host_Init (quakeparms_t *parms)
 			extern void MQ_PHASE_Init(void);
 			extern void MQ_HighFreqMouse_Init(void);
 			extern void MQ_SharePlay_Init(void);
-			extern void MQ_Spatializer_Enable(int enable);
 			MQ_PHASE_Init();
 			MQ_HighFreqMouse_Init();
 			MQ_SharePlay_Init();
-			MQ_Spatializer_Enable(0); // off by default, user can enable
+			// Sound Spatializer removed — overlay was never attached to
+			// the window. Tracked in launcher removal notes.
 		}
 
 		// Metal Quake: initialize settings

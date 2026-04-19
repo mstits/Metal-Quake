@@ -54,7 +54,11 @@ struct MeshUniforms {
     float4   frustumPlanes[6];
     float    time;
     uint     meshletCount;
-    uint     pad0, pad1;
+    // LOD falloff: meshlets beyond lodNearDistance start dropping triangles;
+    // at lodFarDistance they are 1/4 density. Values in Quake world units
+    // (1 unit ≈ 1 inch). Setting both to the same value disables LOD.
+    float    lodNearDistance;
+    float    lodFarDistance;
 };
 
 // Vertex data in the global buffer
@@ -146,29 +150,54 @@ void bspMeshShader(
 {
     uint meshletIdx = payload.meshletIndices[groupIndex];
     BSPMeshlet meshlet = meshlets[meshletIdx];
-    
-    // Set counts for this meshlet
-    output.set_primitive_count(meshlet.triangleCount);
-    
-    // Generate vertices
+
+    // Distance-based LOD: shrink the emitted triangle count for meshlets
+    // far from the camera. Vertices are still fully emitted (uniform mesh
+    // topology makes skipping verts unsafe), but only a fraction of the
+    // primitive list is populated. For a 4× density reduction we issue
+    // every 4th triangle.
+    float distToCam = distance(meshlet.boundingSphere.xyz, uniforms.cameraPosition.xyz);
+    uint  stride;
+    if (uniforms.lodFarDistance <= uniforms.lodNearDistance ||
+        distToCam <= uniforms.lodNearDistance) {
+        stride = 1;
+    } else if (distToCam >= uniforms.lodFarDistance) {
+        stride = 4;
+    } else {
+        float t = (distToCam - uniforms.lodNearDistance) /
+                  (uniforms.lodFarDistance - uniforms.lodNearDistance);
+        // t ∈ [0,1] → 1,2,3,4 stride. 2x is gentle, 4x is aggressive.
+        stride = 1 + uint(floor(t * 3.0));
+    }
+
+    uint emittedTris = (meshlet.triangleCount + stride - 1) / stride;
+    output.set_primitive_count(emittedTris);
+
+    // Generate vertices — always full count. Mesh shaders require any
+    // vertex referenced by an emitted index to be set, so skipping verts
+    // based on LOD would need an index-remapping pass we don't want in
+    // the hot path.
     if (threadIndex < meshlet.vertexCount) {
         uint vi = meshlet.vertexOffset + threadIndex;
         BSPVertex v = vertices[vi];
-        
+
         MeshVertex mv;
         mv.position = uniforms.viewProjection * float4(v.position, 1.0);
         mv.texCoord = v.texCoord;
         mv.worldPos = v.position;
         mv.normal = v.normal;
         mv.lightLevel = v.lightLevel;
-        
+
         output.set_vertex(threadIndex, mv);
     }
-    
-    // Generate triangle indices (3 indices per triangle)
+
+    // Emit only every `stride`th source triangle. threadIndex < emittedTris
+    // indexes into the sparse set; baseIdx picks out the original triangle.
     uint triIdx = threadIndex;
-    if (triIdx < meshlet.triangleCount) {
-        uint baseIdx = meshlet.indexOffset + triIdx * 3;
+    if (triIdx < emittedTris) {
+        uint srcTri = triIdx * stride;
+        if (srcTri >= meshlet.triangleCount) srcTri = meshlet.triangleCount - 1;
+        uint baseIdx = meshlet.indexOffset + srcTri * 3;
         output.set_index(triIdx * 3 + 0, indices[baseIdx + 0] - meshlet.vertexOffset);
         output.set_index(triIdx * 3 + 1, indices[baseIdx + 1] - meshlet.vertexOffset);
         output.set_index(triIdx * 3 + 2, indices[baseIdx + 2] - meshlet.vertexOffset);
@@ -191,28 +220,34 @@ fragment MeshFragOut bspMeshFragment(
     constant MeshUniforms& uniforms [[buffer(0)]])
 {
     MeshFragOut out;
-    
-    // Sample atlas texture
-    constexpr sampler linearSampler(filter::linear, address::repeat);
-    float4 texColor = atlasTexture.sample(linearSampler, in.texCoord);
-    
+
+    // Pixel-art sampler. Quake textures are tiny (typically 64×64 or
+    // smaller), so linear filtering produces swimming bilerp artifacts
+    // rather than crisp pixel-art edges. Nearest keeps the era-authentic
+    // look and matches the software renderer's pixel bounds.
+    constexpr sampler pointSampler(filter::nearest, address::repeat);
+    float4 texColor = atlasTexture.sample(pointSampler, in.texCoord);
+
     // Apply BSP lightmap
     float3 lit = texColor.rgb * in.lightLevel;
-    
+
     // Simple directional light
     float3 lightDir = normalize(float3(0.4, 0.3, 0.85));
     float nDotL = max(dot(in.normal, lightDir), 0.0);
     lit += texColor.rgb * nDotL * 0.3;
-    
+
     out.color = float4(lit, 1.0);
     out.depth = in.position.z;
-    
-    // Motion vectors from current vs previous projection
+
+    // Motion vectors from current vs previous projection. The old code
+    // skipped the perspective divide on the current NDC, which made
+    // motion vectors garbage for anything not on the near plane. Both
+    // endpoints divide by w now; clip-space output is (x*w, y*w, z*w, w).
     float4 prevClip = uniforms.prevViewProjection * float4(in.worldPos, 1.0);
-    float2 prevNDC = prevClip.xy / prevClip.w;
-    float2 curNDC = in.position.xy / float2(1.0); // Already in clip space
+    float2 prevNDC = prevClip.xy / max(prevClip.w, 0.0001);
+    float2 curNDC  = in.position.xy / max(in.position.w, 0.0001);
     out.motion = (curNDC - prevNDC) * 0.5;
-    
+
     return out;
 }
 

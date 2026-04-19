@@ -1,23 +1,13 @@
 /**
  * @file Sys_Tahoe_Input.mm
- * @brief Metal Quake — Unified Input Handler for macOS 17 Tahoe
+ * @brief Metal Quake — input utilities and per-frame accumulator.
  *
- * Consolidates all input handling into a single, state-aware module:
- * - Raw mouse input via CGEvent deltas (8kHz capable on M3+ MBP)
- * - Keyboard via Carbon key events (NSEvent dispatch)
- * - Game Controller via GameController.framework
- * - Core Haptics feedback integration
- * - Menu/game state-aware cursor management
- *
- * This module is designed to eventually replace the scattered input logic
- * across sys_macos.m, in_null.c, and in_gamecontroller.mm.
- *
- * @note Phase 1: Architecture + bridge definitions. The actual input
- *       processing currently lives in sys_macos.m and in_null.c.
- *       Phase 2 will migrate all input here.
- *
- * @author Metal Quake Team
- * @date 2026
+ * Live input dispatch happens in sys_macos.m (mouse / keyboard / CGEvent)
+ * and in_gamecontroller.mm (GameController). This file holds the shared
+ * per-frame accumulator struct and helpers the other two modules read
+ * through. The original doc comment promised a "Phase 2 migration" that
+ * never happened and has been removed; the split between
+ * sys_macos.m and this file is the shipping architecture now.
  */
 
 #import <Cocoa/Cocoa.h>
