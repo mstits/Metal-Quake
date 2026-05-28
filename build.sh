@@ -150,12 +150,38 @@ OBJ_FILES=()
 COMPILED=0
 SKIPPED=0
 
-# Compile C files (INCREMENTAL: only if source is newer than object)
+# Decide whether an object needs rebuilding.
+#
+# The old check was `[ "$src" -nt "$obj" ]`, which only looked at the
+# translation unit's own mtime. Editing a shared header (quakedef.h,
+# Metal_Settings.h, …) left every dependent object untouched, so the
+# build linked a stale binary that compiled cleanly. We now consume the
+# clang-generated `-MMD` depfile (`build_obj/x.d`) and rebuild if the
+# source OR any header prerequisite is newer than the object.
+needs_rebuild() {
+    local src="$1" obj="$2" dep="$3"
+    [ -f "$obj" ] || return 0           # never built
+    [ "$src" -nt "$obj" ] && return 0   # source changed
+    [ -f "$dep" ] || return 0           # no depfile yet (first run after this change)
+    # Strip the "target:" prefix and line-continuation backslashes, then
+    # split the remaining header list on whitespace. A prereq newer than
+    # the object (or one a stale depfile no longer matches) forces a rebuild.
+    local prereqs p
+    prereqs=$(sed -e 's/^[^:]*://' -e 's/\\$//' "$dep" | tr -s ' \t\n' '\n')
+    for p in $prereqs; do
+        [ -z "$p" ] && continue
+        [ "$p" -nt "$obj" ] && return 0
+    done
+    return 1
+}
+
+# Compile C files (INCREMENTAL: rebuild on source OR header change)
 for f in "${COMMON_SOURCES[@]}"; do
     obj="build_obj/$(basename ${f%.c}.o)"
-    if [ "$f" -nt "$obj" ] || [ ! -f "$obj" ]; then
+    dep="${obj%.o}.d"
+    if needs_rebuild "$f" "$obj" "$dep"; then
         echo "Compiling $f..."
-        $CC $CFLAGS -c "$f" -o "$obj"
+        $CC $CFLAGS -MMD -MF "$dep" -c "$f" -o "$obj"
         COMPILED=$((COMPILED + 1))
     else
         SKIPPED=$((SKIPPED + 1))
@@ -163,18 +189,19 @@ for f in "${COMMON_SOURCES[@]}"; do
     OBJ_FILES+=("$obj")
 done
 
-# Compile macOS Specific files (INCREMENTAL)
+# Compile macOS Specific files (INCREMENTAL: rebuild on source OR header change)
 for f in "${MACOS_SOURCES[@]}"; do
     ext="${f##*.}"
     obj="build_obj/$(basename ${f%.$ext}.o)"
-    if [ "$f" -nt "$obj" ] || [ ! -f "$obj" ]; then
+    dep="${obj%.o}.d"
+    if needs_rebuild "$f" "$obj" "$dep"; then
         echo "Compiling $f..."
         if [ "$ext" == "cpp" ] || [ "$ext" == "mm" ]; then
-            $CXX $CXXFLAGS -c "$f" -o "$obj"
+            $CXX $CXXFLAGS -MMD -MF "$dep" -c "$f" -o "$obj"
         elif [ "$ext" == "m" ]; then
-            $CC $OBJCFLAGS -c "$f" -o "$obj"
+            $CC $OBJCFLAGS -MMD -MF "$dep" -c "$f" -o "$obj"
         else
-            $CC $CFLAGS -c "$f" -o "$obj"
+            $CC $CFLAGS -MMD -MF "$dep" -c "$f" -o "$obj"
         fi
         COMPILED=$((COMPILED + 1))
     else
@@ -187,7 +214,9 @@ done
 if [ ${#SWIFT_SOURCES[@]} -gt 0 ]; then
     SWIFT_OBJ="build_obj/MetalQuakeLauncher.o"
     SWIFT_NEEDS_REBUILD=0
-    for sf in "${SWIFT_SOURCES[@]}"; do
+    # The launcher imports MetalQuakeBridge.h via -import-objc-header, so a
+    # change to the bridging header must also retrigger the Swift compile.
+    for sf in "${SWIFT_SOURCES[@]}" src/macos/MetalQuakeBridge.h; do
         if [ "$sf" -nt "$SWIFT_OBJ" ] || [ ! -f "$SWIFT_OBJ" ]; then
             SWIFT_NEEDS_REBUILD=1
             break
