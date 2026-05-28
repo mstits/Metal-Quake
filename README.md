@@ -50,9 +50,9 @@ Features are categorized honestly:
 | **SVGF Denoise** | Compute | Shipped | `r_svgf` cvar: mode 1 temporal reprojection, mode 2 full variance-guided (RG16F moments + R16F variance + dedicated `svgfVariance` kernel) |
 | **Frame Interpolation** | MetalFX | Shipped | Real `MTLFXFrameInterpolator` encode pass via `MQ_FrameInterp.m` ObjC shim; `r_frameinterp` cvar |
 | **BLAS Split** | Metal RT | Shipped | `r_rt_split_blas` cvar: world BLAS cached per map + entity BLAS per frame + 2-instance IAS with per-instance metadata offsets for correct TriTexInfo lookup |
-| **ReSTIR DI** | Compute | Shipped | `r_restir` cvar: CPU builds emissive-triangle list from 8×8 atlas-grid sampling; shader does 4-candidate weighted reservoir sampling with RIS normalization |
+| **ReSTIR DI** | Compute | Shipped | `r_restir` cvar: CPU builds emissive-triangle list from 8×8 atlas-grid sampling; shader does 4-candidate RIS **plus temporal (motion-reprojected) and spatial (neighbor) reservoir reuse** persisted in ping-pong device buffers — true ReSTIR, converging with one shadow ray per pixel |
 | **Argument Buffers** | Metal | Shipped | 6 RT device pointers (vertices, indices, triTexInfos, dynLights, instanceOffsets, emissiveTris) wrapped in a single `MTLArgumentEncoder` buffer at slot 5 with per-resource `useResource:` annotation |
-| **PostFX Function Constants** | Metal | Shipped | 5 `[[function_constant]]` toggles (SSAO, CRT, Liquid Glass, chromatic aberration, high-contrast HUD) — infrastructure for pipeline-variant dead-code elimination |
+| **PostFX Function Constants** | Metal | Shipped | 5 `[[function_constant]]` toggles (SSAO, CRT, Liquid Glass, chromatic aberration, high-contrast HUD); a settings-mask-keyed pipeline cache builds + selects the specialized variant each frame so disabled stages are dead-code-eliminated, not runtime-branched |
 | **GPU Denoising** | MPS / MPSGraph | Shipped | Bilateral à-trous (primary) + MPSImageGaussianBlur (opt-in via `MQ_MPS_DENOISE=1` env) |
 | **CoreML Upscaler** | MLModel + ANE | Shipped | `MLModel.modelWithContentsOfURL:` loads `MQ_RealESRGAN.mlmodelc` and runs on ANE at 320×240 baked input; MPSGraph (bilinear + unsharp conv) fallback for other sizes |
 | **MetalFX Temporal** | MetalFX | Shipped | 640×480 → 1280×960 upscale with Halton(2,3) jitter + RT depth + motion vectors |

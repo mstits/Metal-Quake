@@ -4,7 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-_No entries yet._
+### Added
+
+- **ReSTIR temporal + spatial reservoir reuse** — `r_restir` is now true ReSTIR DI, not per-frame RIS. Per-pixel reservoirs persist across frames in ping-pong private device buffers (16 bytes/pixel). Each frame streams 4 fresh emissive candidates, then merges the motion-reprojected reservoir from the previous frame (temporal, `M` clamped to 20) and two neighbor reservoirs from the previous-frame buffer (spatial, `M` clamped to 8), re-evaluating each merged sample's target function at the current shading point. Converges with a single shadow ray per pixel. Reservoirs store the emissive-list slot (not a global triangle index) and reset for one frame on map load, so a stale entry can never index geometry out of bounds.
+- **PostFX pipeline-variant cache wired** — `GetPostFXPipeline(mask)` lazily builds and caches a compositor pipeline specialized for a 5-bit function-constant mask (SSAO / CRT / Liquid Glass / chromatic aberration / high-contrast HUD), selected per-frame from current settings. Disabled stages are now dead-code-eliminated by the Metal compiler instead of runtime-branched per pixel. The all-on variant aliases the existing default pipeline, so the common path never rebuilds.
+- **`CircleBuffer` concurrency test** (`tests/test_ringbuffer.cpp`) — wrap-around, underrun, and a 2,000,000-frame single-producer/single-consumer stress test verifying no torn frames, FIFO order, and a monotonic `framesConsumed`. The class moved to `src/macos/circlebuffer.hpp` so it can be tested without linking Core Audio.
+
+### Changed
+
+- **Header-aware incremental build** — `build.sh` now consumes clang `-MMD` depfiles, so an object rebuilds when any header it includes changes, not just when its own source file is touched. Previously, editing a shared header (`quakedef.h`, `Metal_Settings.h`, …) silently produced a stale binary. The Swift launcher also rebuilds when its bridging header changes.
 
 ---
 

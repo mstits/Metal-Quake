@@ -23,6 +23,7 @@ extern "C" {
 #include <vector>
 #include <string>
 #include <fstream>
+#include <unordered_map>
 
 #include "vid_metal.hpp"
 #include "Metal_Settings.h"
@@ -111,6 +112,14 @@ struct RTVertex { float position[3]; float u, v; };
 static MTL::Device*             _pDevice;
 static MTL::CommandQueue*       _pCommandQueue;
 static MTL::RenderPipelineState* _pPipelineState;
+// PostFX composite library + per-variant pipeline cache. The fragment shader
+// declares 5 function constants (fc_ssao, fc_crt, fc_liquidglass, fc_chroma,
+// fc_hc_hud); each cache key is a 5-bit mask of which stages are compiled in.
+// Disabled stages are dead-code-eliminated rather than gated by a per-pixel
+// runtime branch. The all-on variant (0x1F) is the default pipeline above,
+// seeded into the cache at BuildPipeline time so the common path never rebuilds.
+static MTL::Library*            _pPostFXLibrary = nullptr;
+static std::unordered_map<uint32_t, MTL::RenderPipelineState*> _postFXPipelineCache;
 static MTL::Texture*            _pPaletteTexture;
 static MTL::Texture*            _pIndexTextures[3];
 static MTL::Texture*            _pIntermediateTexture;
@@ -153,6 +162,17 @@ static uint32_t _worldTriCount = 0;
 // many-light direct illumination.
 static std::vector<uint32_t>       _emissiveTriIndices;
 static MTL::Buffer*                _pEmissiveTriBuffer = nullptr;
+
+// ReSTIR DI per-pixel reservoirs, ping-ponged across frames (private storage,
+// 16 bytes/pixel: {uint slot, float wSum, float M, float W}). _reservoirElems
+// tracks the allocated pixel capacity so a resolution change reallocates.
+// _reservoirNeedsReset forces the shader to ignore history for one frame after
+// a map load (the emissive list — and thus valid slot range — has changed).
+static MTL::Buffer*                _pReservoirBuffers[2] = { nullptr, nullptr };
+static int                         _reservoirCurrent     = 0;
+static uint32_t                    _reservoirElems       = 0;
+static bool                        _reservoirNeedsReset  = true;
+static const size_t                kReservoirStride      = 16; // bytes per pixel
 
 // Argument-buffer state for the RT dispatch. _pRTArgBuffer holds 6
 // device-pointer slots encoded by the argument encoder derived from
@@ -841,6 +861,9 @@ static void BuildRTXWorld() {
             _emissiveTriIndices.size() * sizeof(uint32_t),
             MTL::ResourceStorageModeShared);
     }
+    // The emissive-list slot range just changed, so any reservoir history
+    // refers to the wrong (or out-of-range) light. Force a one-frame reset.
+    _reservoirNeedsReset = true;
 
     _worldGeomBuilt = true;
     } // end if (!_worldGeomBuilt)
@@ -1740,6 +1763,9 @@ static void BuildPipeline() {
     if (pArchive && _pPipelineState) {
         ((void (*)(id, SEL, id, id))objc_msgSend)((id)pArchive, sel_registerName("addRenderPipelineFunctionsWithDescriptor:error:"), (id)pDesc, nullptr);
     }
+    // Seed the variant cache: the default pipeline IS the all-stages-on
+    // (0x1F) specialization, so GetPostFXPipeline never rebuilds it.
+    if (_pPipelineState) _postFXPipelineCache[0x1F] = _pPipelineState;
     
     pVertexFn->release(); pFragFn->release();
 
@@ -1821,6 +1847,47 @@ static void BuildPipeline() {
             return fract(sin(dot(p, float2(127.1, 311.7))) * 43758.5453);
         }
 
+        // === ReSTIR DI reservoir ===
+        // Persisted per-pixel across frames in ping-pong device buffers so
+        // direct illumination from emissive surfaces accumulates samples
+        // temporally (reprojected through camera motion) and spatially
+        // (neighbor taps from the previous frame). `y` is a SLOT into the
+        // emissive-triangle list (not a global triangle index) so a stale
+        // reservoir surviving a map change can be clamped to the new list
+        // and can never index geometry out of bounds. W is the unbiased
+        // contribution weight wSum/(M*pHat(y)).
+        struct Reservoir {
+            uint  y;      // chosen emissive-list slot; 0xFFFFFFFF = empty
+            float wSum;   // running sum of resampling weights
+            float M;      // effective sample count
+            float W;      // unbiased contribution weight
+        };
+
+        // Target function pHat at a shading point for an emissive triangle:
+        // cosine × inverse-square to its centroid. Also returns the centroid.
+        float restirPHat(uint eTri, float3 hitPos, float3 N,
+                         device const RTVertex* verts, device const uint* indices,
+                         thread float3& outCentroid) {
+            uint i0 = indices[eTri*3], i1 = indices[eTri*3+1], i2 = indices[eTri*3+2];
+            float3 c = (getPos(verts,i0) + getPos(verts,i1) + getPos(verts,i2)) * (1.0/3.0);
+            outCentroid = c;
+            float3 toL = c - hitPos;
+            float  dsq = dot(toL, toL);
+            if (dsq < 0.1 || dsq > 2000.0*2000.0) return 0.0;
+            return max(dot(N, toL * rsqrt(dsq)), 0.0) / dsq;
+        }
+
+        // Stream one candidate (or a merged reservoir, via mInc) into the
+        // running reservoir using weighted reservoir sampling.
+        void restirStream(thread Reservoir& r, thread float& rPHat, thread float3& rCentroid,
+                          uint slot, float w, float pHat, float3 centroid, float mInc, float rnd) {
+            r.wSum += w;
+            r.M    += mInc;
+            if (r.wSum > 0.0 && rnd < w / r.wSum) {
+                r.y = slot; rPHat = pHat; rCentroid = centroid;
+            }
+        }
+
         // Argument buffer — wraps the 6 RT device pointers into one bind.
         // IDs 0..5 correspond to the previous per-slot positional
         // parameters (vertices was buffer 5, indices 6, etc). Moving to
@@ -1858,7 +1925,10 @@ static void BuildPipeline() {
             constant int&    rtQuality [[buffer(15)]],
             constant int&    underwaterFlag [[buffer(16)]],
             constant int&    emissiveCount [[buffer(19)]],
-            constant int&    useReSTIR     [[buffer(20)]])
+            constant int&    useReSTIR     [[buffer(20)]],
+            device const Reservoir* prevReservoirs [[buffer(6)]],
+            device Reservoir*       curReservoirs  [[buffer(7)]],
+            constant int&    restirReset   [[buffer(21)]])
         {
             // Local aliases so the existing shader body keeps reading
             // `vertices[i]` etc. Compiled by the optimizer into direct
@@ -1901,6 +1971,12 @@ static void BuildPipeline() {
                 outTexture.write(float4(sky, 1.0), tid);
                 depthTexture.write(float4(1.0, 0, 0, 0), tid);   // Max depth for sky
                 motionTexture.write(float4(0, 0, 0, 0), tid);     // No motion for sky
+                // Keep every reservoir slot valid so next frame's temporal /
+                // spatial reuse never reads stale data from a sky pixel.
+                if (useReSTIR != 0) {
+                    Reservoir e; e.y = 0xFFFFFFFFu; e.wSum = 0.0; e.M = 0.0; e.W = 0.0;
+                    curReservoirs[tid.y * outTexture.get_width() + tid.x] = e;
+                }
                 return;
             }
 
@@ -2261,45 +2337,110 @@ static void BuildPipeline() {
 
             // === ReSTIR DI over emissive world surfaces ===
             //
-            // Weighted-reservoir sampling: pick `kRestir` random emissive
-            // triangles, weight each candidate by its inverse-square
-            // distance × cosine-to-surface, pick one via RIS. Cast a
-            // single shadow ray. The estimator normalizes back to an
-            // unbiased many-light contribution: pHat(chosen) × sumW /
-            // (kRestir × pHat(chosen)) = sumW / kRestir.
+            // Per-pixel weighted-reservoir sampling with temporal + spatial
+            // reuse. Each frame draws `kRestir` fresh candidate emissive
+            // triangles (RIS), then merges (a) the reprojected reservoir from
+            // the previous frame and (b) a couple of neighbor reservoirs from
+            // the previous-frame buffer. A single shadow ray validates the
+            // final chosen sample. Reservoirs persist in ping-pong device
+            // buffers; `restirReset` clears history on map load / camera cut.
+            // This is the step up from the prior single-pass RIS: temporal
+            // history is what makes the estimator converge with one ray.
+            uint pixIdx = tid.y * outTexture.get_width() + tid.x;
             if (useReSTIR != 0 && emissiveCount > 0) {
-                const int kRestir = 4;
-                int chosenIdx = -1;
-                float3 chosenCentroid = float3(0);
-                float3 chosenColor = float3(1);
-                float chosenPHat = 0.0;
-                float totalW = 0.0;
+                const int   kRestir       = 4;
+                const float kMaxTemporalM = 20.0;  // bound history age → responsive to light changes
+                const float kMaxSpatialM  = 8.0;
+                const uint  eMax          = uint(emissiveCount - 1);
+
+                Reservoir res; res.y = 0xFFFFFFFFu; res.wSum = 0.0; res.M = 0.0; res.W = 0.0;
+                float  resPHat = 0.0;
+                float3 resCentroid = float3(0.0);
+
+                // (1) Fresh candidates — uniform proposal over the emissive list.
                 for (int ri = 0; ri < kRestir; ri++) {
-                    uint  rndIdx = uint(fract(float(seed * (53 + ri * 23)) / 4294967296.0) * float(emissiveCount));
-                    uint  eTri   = emissiveTris[rndIdx];
-                    // Centroid of emissive triangle.
-                    uint ei0 = indices[eTri*3], ei1 = indices[eTri*3+1], ei2 = indices[eTri*3+2];
-                    float3 p0 = getPos(vertices, ei0);
-                    float3 p1 = getPos(vertices, ei1);
-                    float3 p2 = getPos(vertices, ei2);
-                    float3 centroid = (p0 + p1 + p2) * (1.0/3.0);
-                    float3 toLight = centroid - hitPos;
-                    float  dsq = dot(toLight, toLight);
-                    if (dsq < 0.1 || dsq > 2000.0 * 2000.0) continue;
-                    float3 lDir = toLight * rsqrt(dsq);
-                    float  nDotL = max(dot(N, lDir), 0.0);
-                    if (nDotL < 0.001) continue;
-                    // Target function: cosine × 1/dist².
-                    float pHat = nDotL / dsq;
-                    totalW += pHat;
+                    uint slot = uint(fract(float(seed * (53 + ri * 23)) / 4294967296.0) * float(emissiveCount));
+                    slot = min(slot, eMax);
+                    float3 cen;
+                    float pHat = restirPHat(emissiveTris[slot], hitPos, N, vertices, indices, cen);
+                    if (pHat <= 0.0) { res.M += 1.0; continue; } // candidate considered but unlit
                     float rr = fract(float(seed * (71 + ri * 37)) / 4294967296.0);
-                    if (totalW > 0.0 && rr < pHat / totalW) {
-                        chosenIdx = int(rndIdx);
-                        chosenCentroid = centroid;
-                        chosenPHat = pHat;
-                        // Sample the emissive triangle's atlas color for tint.
-                        // (We read via the world-BLAS offset = 0 so this
-                        // is always in the world region of triTexInfos.)
+                    restirStream(res, resPHat, resCentroid, slot, pHat, pHat, cen, 1.0, rr);
+                }
+
+                // (2) Temporal reuse — reproject hitPos into the previous frame.
+                if (restirReset == 0) {
+                    float3 toPrev = hitPos - prevCamOrigin.xyz;
+                    float  prevZ  = dot(toPrev, prevCamForward.xyz);
+                    if (prevZ > 0.01) {
+                        float Wf = float(outTexture.get_width());
+                        float Hf = float(outTexture.get_height());
+                        float aspect = Wf / Hf;
+                        // Invert the primary-ray uv→pixel map for the prev camera.
+                        float pu = dot(toPrev, prevCamRight.xyz) / prevZ;
+                        float pv = dot(toPrev, prevCamUp.xyz)    / prevZ;
+                        int ppx = int(((pu / aspect) * 0.5 + 0.5) * Wf);
+                        int ppy = int(((-pv)         * 0.5 + 0.5) * Hf);
+                        if (ppx >= 0 && ppy >= 0 && ppx < int(Wf) && ppy < int(Hf)) {
+                            Reservoir t = prevReservoirs[uint(ppy) * uint(Wf) + uint(ppx)];
+                            if (t.M > 0.0 && t.y != 0xFFFFFFFFu && t.W > 0.0) {
+                                uint slot = min(t.y, eMax);
+                                float3 cen;
+                                float pHatP = restirPHat(emissiveTris[slot], hitPos, N, vertices, indices, cen);
+                                if (pHatP > 0.0) {
+                                    float mC = min(t.M, kMaxTemporalM);
+                                    float rr = fract(float(seed * 91) / 4294967296.0);
+                                    restirStream(res, resPHat, resCentroid, slot, t.W * pHatP * mC, pHatP, cen, mC, rr);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // (3) Spatial reuse — neighbor reservoirs from the previous frame.
+                if (restirReset == 0) {
+                    int Wi = int(outTexture.get_width());
+                    int Hi = int(outTexture.get_height());
+                    for (int sp = 0; sp < 2; sp++) {
+                        float a   = fract(float(seed * (101 + sp * 57)) / 4294967296.0) * 6.2831853;
+                        float rad = 1.0 + fract(float(seed * (113 + sp * 61)) / 4294967296.0) * 8.0;
+                        int nx = int(tid.x) + int(cos(a) * rad);
+                        int ny = int(tid.y) + int(sin(a) * rad);
+                        if (nx < 0 || ny < 0 || nx >= Wi || ny >= Hi) continue;
+                        Reservoir nb = prevReservoirs[uint(ny) * uint(Wi) + uint(nx)];
+                        if (nb.M <= 0.0 || nb.y == 0xFFFFFFFFu || nb.W <= 0.0) continue;
+                        uint slot = min(nb.y, eMax);
+                        float3 cen;
+                        float pHatN = restirPHat(emissiveTris[slot], hitPos, N, vertices, indices, cen);
+                        if (pHatN <= 0.0) continue;
+                        float mC = min(nb.M, kMaxSpatialM);
+                        float rr = fract(float(seed * (127 + sp * 67)) / 4294967296.0);
+                        restirStream(res, resPHat, resCentroid, slot, nb.W * pHatN * mC, pHatN, cen, mC, rr);
+                    }
+                }
+
+                // Finalize the unbiased weight W = wSum / (M * pHat(chosen)).
+                res.W = (res.y != 0xFFFFFFFFu && resPHat > 0.0 && res.M > 0.0)
+                      ? res.wSum / (res.M * resPHat) : 0.0;
+
+                // Shade: one shadow ray to the chosen emissive centroid.
+                if (res.y != 0xFFFFFFFFu && res.W > 0.0) {
+                    float3 toLight = resCentroid - hitPos;
+                    float  dist2 = length(toLight);
+                    float3 lDir  = toLight / max(dist2, 0.01);
+                    float  shadowBias = 0.05 + dist * 0.0002;
+                    ray srr;
+                    srr.origin       = hitPos + N * shadowBias;
+                    srr.direction    = lDir;
+                    srr.min_distance = shadowBias;
+                    srr.max_distance = dist2 - 0.5;
+                    bool visible = (isect.intersect(srr, scene).type != intersection_type::triangle);
+                    if (visible) {
+                        // Tint by the chosen triangle's atlas color (world-BLAS
+                        // offset 0, so the emissive slot maps straight into
+                        // triTexInfos[]).
+                        uint eTri = emissiveTris[min(res.y, eMax)];
+                        float3 chosenColor = float3(1.0);
                         TriTexInfo eTti = triTexInfos[eTri];
                         if (eTti.atlas_w >= 0.0 && eTti.tex_w >= 1.0) {
                             float esu = eTti.tex_w * 0.5;
@@ -2309,29 +2450,19 @@ static void BuildPipeline() {
                             int eay = clamp((int)(eTti.atlas_v*(float)erah+esv), 0, erah-1);
                             chosenColor = atlasTexture.read(uint2(eax, eay)).rgb;
                         }
-                    }
-                }
-                if (chosenIdx >= 0 && chosenPHat > 0.0) {
-                    float3 toLight = chosenCentroid - hitPos;
-                    float  dist2 = length(toLight);
-                    float3 lDir  = toLight / max(dist2, 0.01);
-                    float  shadowBias = 0.05 + dist * 0.0002;
-                    ray srr;
-                    srr.origin = hitPos + N * shadowBias;
-                    srr.direction = lDir;
-                    srr.min_distance = shadowBias;
-                    srr.max_distance = dist2 - 0.5;
-                    bool visible = (isect.intersect(srr, scene).type != intersection_type::triangle);
-                    if (visible) {
                         float nDotL = max(dot(N, lDir), 0.0);
-                        // RIS-normalized contribution. 1/dist² already
-                        // baked into pHat; we factor back out the chosen
-                        // pHat and apply the reservoir's sum.
-                        float contribScale = (totalW / (float(kRestir) * chosenPHat));
                         float atten = nDotL / (dist2 * dist2 * 0.00001 + 1.0);
-                        lighting += chosenColor * atten * contribScale * 0.15;
+                        lighting += chosenColor * atten * res.W * 0.15;
                     }
                 }
+
+                // Persist the merged reservoir for next frame's reuse.
+                curReservoirs[pixIdx] = res;
+            } else if (useReSTIR != 0) {
+                // ReSTIR on but this map has no emissive surfaces — keep the
+                // buffer well-defined so a later state never reads garbage.
+                Reservoir e; e.y = 0xFFFFFFFFu; e.wSum = 0.0; e.M = 0.0; e.W = 0.0;
+                curReservoirs[pixIdx] = e;
             }
 
             float3 color = baseColor * lighting;
@@ -2401,7 +2532,50 @@ static void BuildPipeline() {
         }
         pRTLib->release();
     }
-    pLib->release(); pDesc->release();
+    // Retain the PostFX library so GetPostFXPipeline can build specialized
+    // variants on demand. Released in VID_Shutdown.
+    _pPostFXLibrary = pLib;
+    pDesc->release();
+}
+
+// Lazily build + cache a PostFX composite pipeline specialized for a given
+// 5-bit function-constant mask (bit i = stage i compiled in). On any compile
+// failure the all-on default pipeline is cached for that key so a bad
+// combination falls back gracefully and is never retried per-frame.
+static MTL::RenderPipelineState* GetPostFXPipeline(uint32_t fcMask) {
+    fcMask &= 0x1F;
+    auto it = _postFXPipelineCache.find(fcMask);
+    if (it != _postFXPipelineCache.end()) return it->second;
+    if (!_pPostFXLibrary || !_pDevice) return _pPipelineState;
+
+    using NS::StringEncoding::UTF8StringEncoding;
+    auto* pFCV = MTL::FunctionConstantValues::alloc()->init();
+    for (int i = 0; i < 5; i++) {
+        bool on = ((fcMask >> i) & 1u) != 0;
+        pFCV->setConstantValue(&on, MTL::DataTypeBool, i);
+    }
+    NS::Error* err = nullptr;
+    auto* pFrag = _pPostFXLibrary->newFunction(
+        NS::String::string("fragmentMain", UTF8StringEncoding), pFCV, &err);
+    pFCV->release();
+    if (!pFrag) {
+        _postFXPipelineCache[fcMask] = _pPipelineState;
+        return _pPipelineState;
+    }
+    auto* pVtx = _pPostFXLibrary->newFunction(NS::String::string("vertexMain", UTF8StringEncoding));
+    auto* pDesc = MTL::RenderPipelineDescriptor::alloc()->init();
+    pDesc->setVertexFunction(pVtx);
+    pDesc->setFragmentFunction(pFrag);
+    pDesc->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
+    NS::Error* psErr = nullptr;
+    auto* ps = _pDevice->newRenderPipelineState(pDesc, &psErr);
+    pVtx->release(); pFrag->release(); pDesc->release();
+    if (!ps) {
+        _postFXPipelineCache[fcMask] = _pPipelineState;
+        return _pPipelineState;
+    }
+    _postFXPipelineCache[fcMask] = ps;
+    return ps;
 }
 
 static void UpdatePaletteLUT(unsigned char *palette) {
@@ -3026,14 +3200,38 @@ extern "C" void VID_Update(vrect_t *rects) {
                 cvar_t *restirCvar = Cvar_FindVar((char*)"r_restir");
                 int useRestirBind = (restirCvar && restirCvar->value != 0.0f) ? 1 : 0;
                 pCompEnc->setBytes(&useRestirBind, sizeof(int), 20);
+
+                // --- ReSTIR reservoir ping-pong (slots 6 = prev, 7 = cur) ---
+                // Allocated lazily and resized with the RT output texture. The
+                // shader writes every pixel each frame, so private storage is
+                // fine (never CPU-read); a reallocation or map load forces a
+                // one-frame history reset.
+                uint32_t needElems = (uint32_t)(_pRTOutputTexture->width() * _pRTOutputTexture->height());
+                if (_reservoirElems != needElems || !_pReservoirBuffers[0] || !_pReservoirBuffers[1]) {
+                    for (int b = 0; b < 2; b++) {
+                        if (_pReservoirBuffers[b]) { _pReservoirBuffers[b]->release(); _pReservoirBuffers[b] = nullptr; }
+                        _pReservoirBuffers[b] = _pDevice->newBuffer(needElems * kReservoirStride, MTL::ResourceStorageModePrivate);
+                    }
+                    _reservoirElems = needElems;
+                    _reservoirCurrent = 0;
+                    _reservoirNeedsReset = true;
+                }
+                int prevIdx = _reservoirCurrent ^ 1;
+                pCompEnc->setBuffer(_pReservoirBuffers[prevIdx],        0, 6);
+                pCompEnc->setBuffer(_pReservoirBuffers[_reservoirCurrent], 0, 7);
+                int restirResetBind = (_reservoirNeedsReset || _temporalReset) ? 1 : 0;
+                pCompEnc->setBytes(&restirResetBind, sizeof(int), 21);
+
                 pCompEnc->dispatchThreads(MTL::Size(_pRTOutputTexture->width(), _pRTOutputTexture->height(), 1), MTL::Size(_pRTComputeState->threadExecutionWidth(), _pRTComputeState->maxTotalThreadsPerThreadgroup() / _pRTComputeState->threadExecutionWidth(), 1));
                 pCompEnc->endEncoding();
-                
+
                 memcpy(_prevCamOrigin, fOrigin, 16);
                 memcpy(_prevCamForward, fForward, 16);
                 memcpy(_prevCamRight, fRight, 16);
                 memcpy(_prevCamUp, fUp, 16);
                 _temporalReset = false;
+                _reservoirNeedsReset = false;
+                _reservoirCurrent ^= 1;   // this frame's output becomes next frame's history
                 _frameIndex++;
                 
                 // SVGF temporal reprojection (scaffolding). Off by default
@@ -3170,7 +3368,22 @@ extern "C" void VID_Update(vrect_t *rects) {
             pRpd->colorAttachments()->object(0)->setTexture(pDrawable->texture()); pRpd->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionDontCare); pRpd->colorAttachments()->object(0)->setStoreAction(MTL::StoreActionStore);
             
             auto* pEnc = pCmdRender->renderCommandEncoder(pRpd);
-            pEnc->setRenderPipelineState(_pPipelineState); pEnc->setFragmentTexture(pCurrentIdxTex, 0); pEnc->setFragmentTexture(_pPaletteTexture, 1); pEnc->setFragmentTexture(_pRTOutputTexture, 2); pEnc->setFragmentTexture(_pRTDepthTexture, 3);
+            // Select the PostFX pipeline specialized for the currently-enabled
+            // stages so the compiler has dead-code-eliminated the off ones.
+            // First use of a new settings combination builds + caches its
+            // variant; thereafter it's a hash lookup.
+            {
+                MetalQuakeSettings* sfx = MQ_GetSettings();
+                uint32_t fcMask = 0;
+                if (sfx->ssao_enabled)         fcMask |= (1u << 0);
+                if (sfx->crt_mode)             fcMask |= (1u << 1);
+                if (sfx->liquid_glass_ui)      fcMask |= (1u << 2);
+                if (sfx->chromatic_aberration) fcMask |= (1u << 3);
+                if (sfx->high_contrast_hud)    fcMask |= (1u << 4);
+                MTL::RenderPipelineState* pPostFX = GetPostFXPipeline(fcMask);
+                pEnc->setRenderPipelineState(pPostFX ? pPostFX : _pPipelineState);
+            }
+            pEnc->setFragmentTexture(pCurrentIdxTex, 0); pEnc->setFragmentTexture(_pPaletteTexture, 1); pEnc->setFragmentTexture(_pRTOutputTexture, 2); pEnc->setFragmentTexture(_pRTDepthTexture, 3);
             
             struct {
                 float screenBlend[4];
@@ -3369,6 +3582,19 @@ extern "C" void VID_Shutdown(void) {
     if (_pRTArgEncoder) { _pRTArgEncoder->release(); _pRTArgEncoder = nullptr; }
     if (_pRTArgBuffer)  { _pRTArgBuffer->release();  _pRTArgBuffer  = nullptr; }
     if (_pRTFunction)   { _pRTFunction->release();   _pRTFunction   = nullptr; }
+
+    // PostFX variant cache: release the specialized pipelines (but not the
+    // 0x1F entry, which aliases _pPipelineState), then the shared library.
+    for (auto& kv : _postFXPipelineCache) {
+        if (kv.second && kv.second != _pPipelineState) kv.second->release();
+    }
+    _postFXPipelineCache.clear();
+    if (_pPostFXLibrary) { _pPostFXLibrary->release(); _pPostFXLibrary = nullptr; }
+
+    for (int b = 0; b < 2; b++) {
+        if (_pReservoirBuffers[b]) { _pReservoirBuffers[b]->release(); _pReservoirBuffers[b] = nullptr; }
+    }
+    _reservoirElems = 0;
 }
 extern "C" void D_BeginDirectRect(int x, int y, byte *pbitmap, int width, int height) {}
 extern "C" void D_EndDirectRect(int x, int y, int width, int height) {}

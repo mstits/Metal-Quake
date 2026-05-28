@@ -331,18 +331,44 @@ flowchart TB
     end
 
     subgraph PerPixel["Per pixel in raytraceMain"]
-        Upload --> Pick[Pick 4 random candidates]
-        Pick --> Weight["w = cos(N,L) / dist_squared"]
-        Weight --> Reservoir[RIS reservoir accumulate]
-        Reservoir --> Chosen[Pick winner by w/sumW]
-        Chosen --> Shadow[Cast shadow ray to centroid]
-        Shadow --> Contrib["add chosen.color × atten × sumW/kRestir × 0.15"]
+        Upload --> Pick["Stream kRestir=4 fresh candidates (RIS)"]
+        Pick --> Temporal["Merge reprojected reservoir (prev frame, M clamped to 20)"]
+        Temporal --> Spatial["Merge 2 neighbor reservoirs (prev-frame buffer, M clamped to 8)"]
+        Spatial --> Finalize["W = wSum / (M · pHat(chosen))"]
+        Finalize --> Shadow[Cast one shadow ray to chosen centroid]
+        Shadow --> Contrib["add chosen.color × atten × W × 0.15"]
+        Contrib --> Store["write merged reservoir → curReservoirs[pixel]"]
     end
 ```
 
-The `0.15` contribution scale is conservative so ReSTIR can't overpower
-the existing BSP lightmap. The estimator is unbiased weighted-reservoir
-importance sampling (WRIS) with `kRestir = 4` candidates.
+### Reservoir reuse
+
+The per-pixel reservoir is stored across frames in two ping-pong device
+buffers (`_pReservoirBuffers[2]`, private storage, 16 bytes/pixel:
+`{uint slot, float wSum, float M, float W}`). Each frame:
+
+1. **Initial sampling** — `kRestir = 4` fresh candidate emissive triangles
+   are streamed in via weighted reservoir sampling (the original RIS step).
+2. **Temporal reuse** — the hit point is reprojected through the previous
+   camera basis (the same inverse-uv math the motion-vector pass uses); the
+   reservoir at that pixel is merged in, with its `M` clamped to 20 so old
+   history can't dominate and lighting stays responsive.
+3. **Spatial reuse** — two neighbor reservoirs from the *previous-frame*
+   buffer (reading last frame's data avoids a same-pass write race) are
+   merged, `M` clamped to 8.
+
+Each merge re-evaluates the neighbor's chosen light's target function
+`pHat` at the current shading point, per the standard reservoir-combine
+estimator. The reservoir stores the emissive-list **slot**, not a global
+triangle index, so a stale reservoir surviving a map change is clamped into
+the new list and can never index geometry out of bounds. History is reset
+for one frame (`restirReset`) on map load (the emissive list — and thus the
+valid slot range — has changed) and on the startup/camera-cut signal.
+
+The `0.15` contribution scale is conservative so ReSTIR can't overpower the
+existing BSP lightmap. Temporal accumulation is what lets the single shadow
+ray per pixel converge — the prior build did the RIS step without reuse, so
+it was effectively per-frame RIS rather than true ReSTIR.
 
 ---
 
@@ -591,8 +617,10 @@ flowchart LR
     DevID --> Notary["ditto + notarytool submit + stapler staple"]
 ```
 
-The build script (`./build.sh`) does incremental compile via source-file
-mtimes, weak-links MetalFX + PHASE so older macOS versions boot but
+The build script (`./build.sh`) does incremental compile keyed on
+clang `-MMD` depfiles (`build_obj/*.d`) — an object rebuilds when its
+source **or any header prerequisite** changes, not just the translation
+unit's own mtime. It weak-links MetalFX + PHASE so older macOS versions boot but
 degrade, and generates the bundle's `Info.plist` via a heredoc. Metal
 shaders compile through `xcrun metal`; the Metal Toolchain is a separate
 Xcode download (`xcodebuild -downloadComponent MetalToolchain`) on
@@ -613,6 +641,11 @@ Current coverage:
 | --------------------- | -------- | -------------------------------------------- |
 | `test_settings.cpp`   | 34 fields| `MQ_Save`/`MQ_Load` round trip + defaults    |
 | `test_addr.cpp`       | 4 cases  | `UDP_AddrCompare` semantics contract         |
+| `test_ringbuffer.cpp` | 3 cases  | `CircleBuffer` wrap-around, underrun, and a 2M-frame concurrent SPSC hand-off (no tears, FIFO order, monotonic `framesConsumed`) |
+
+The ring-buffer test exercises the lock-free audio hand-off described in
+§8. `CircleBuffer` was extracted into `src/macos/circlebuffer.hpp` so the
+test can include it without linking Core Audio.
 
 The settings test caught a real regression: the fscanf loop in
 `MQ_LoadSettings` was aborting at the top-of-file `//` comment line,
@@ -658,7 +691,7 @@ registered cvar.
 
 | Item                                      | Status                              | Why                                                                                     |
 | ----------------------------------------- | ----------------------------------- | --------------------------------------------------------------------------------------- |
-| PostFX pipeline cache over 5 FCV variants | Infrastructure in place, cache stub | The 5 function constants specialize but the cache-keyed lookup isn't wired yet          |
+| PostFX pipeline cache over 5 FCV variants | Wired                               | `GetPostFXPipeline(mask)` builds + caches a specialized variant per 5-bit settings mask; selected per-frame in the composite pass. Disabled stages are dead-code-eliminated instead of runtime-branched. |
 | Trained Real-ESRGAN weights               | Load path ready                     | `.mlmodelc` is deterministic conv; trained weights need a training pipeline we don't run|
 | macOS Game Mode assertions                | Info.plist category set             | Gates require runtime assertion + Game Center sign-in                                   |
 | App Sandbox entitlements                  | Not configured                      | Distribution via Mac App Store would need a sandbox plist + access prompts              |
